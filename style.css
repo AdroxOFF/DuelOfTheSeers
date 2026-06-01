@@ -99,6 +99,63 @@ header {
   border-bottom: 1px solid var(--border);
   position: relative;
 }
+/* === EREDMÉNYJELZŐ (ÚJ) === */
+.score-board {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 32px;
+  margin-bottom: 12px;
+  background: linear-gradient(135deg, var(--surface) 0%, var(--obsidian-3) 100%);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 20px;
+  position: relative;
+}
+.score-board::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--emerald-light), transparent);
+}
+.score-box { text-align: center; min-width: 90px; }
+.score-label {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 10px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 4px;
+}
+.score-value {
+  font-family: 'Cinzel Decorative', serif;
+  font-size: 42px;
+  font-weight: 900;
+  text-shadow: 0 0 20px rgba(0,0,0,0.5);
+}
+.score-box.mine .score-value { color: var(--purple-light); }
+.score-box.enemy .score-value { color: var(--gold); }
+.score-center { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+.score-vs { font-family: 'Cinzel', serif; font-size: 18px; color: var(--text-secondary); }
+.score-diff {
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 11px;
+  background: var(--surface-3);
+  padding: 4px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+.final-score-projection {
+  text-align: center;
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 13px;
+  color: var(--gold-light);
+  margin-bottom: 24px;
+  letter-spacing: 0.1em;
+  text-shadow: 0 0 10px rgba(201,162,39,0.3);
+}
 
 header::after {
   content: '';
