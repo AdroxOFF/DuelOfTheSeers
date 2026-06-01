@@ -20,7 +20,7 @@
   <!-- ═══ FEJLÉC ═══ -->
   <header>
     <div class="title-rune">⚔ Látók Párbaja ⚔</div>
-    <div class="title-sub">Oracle Helper System v1.0</div>
+    <div class="title-sub">Oracle Helper System v1.1</div>
     <div class="shortcut-hint" style="margin-top:8px;">
       <kbd>ESC</kbd> Teljes reset &nbsp;|&nbsp; <kbd>⌫</kbd> Visszavonás
     </div>
@@ -39,15 +39,17 @@
     <!-- Saját lapok panel -->
     <div class="panel">
       <div class="panel-title">Saját lapjaim</div>
-      <div class="cards-row" id="myCardsRow">
-        <!-- JavaScript tölti fel -->
+      <!-- Kétsoros kártya-tartó: páratlan (fehér) fent, páros (fekete) lent -->
+      <div class="cards-two-rows" id="myCardsRow">
+        <!-- JavaScript tölti fel két .cards-sub-row sorral -->
       </div>
     </div>
 
     <!-- Ellenfél lehetséges lapjai panel -->
     <div class="panel enemy-panel">
       <div class="panel-title">Ellenfél lehetséges lapjai</div>
-      <div class="enemy-cards-row" id="enemyCardsRow">
+      <!-- Kétsoros kártya-tartó -->
+      <div class="enemy-cards-two-rows" id="enemyCardsRow">
         <!-- JavaScript tölti fel -->
       </div>
       <div class="divider" style="margin-top:14px;"></div>
@@ -70,6 +72,21 @@
 
     <!-- ═══ AKCIÓ TERÜLET ═══ -->
     <div class="action-area">
+
+      <!-- 0. lépés: Én kezdem kapcsoló -->
+      <div class="panel i-start-panel" style="padding:14px 16px;">
+        <div class="step-title">⓪ Ki kezdi a kört?</div>
+        <label class="toggle-label" for="chkIStart">
+          <input type="checkbox" id="chkIStart" class="toggle-checkbox">
+          <span class="toggle-track">
+            <span class="toggle-thumb"></span>
+          </span>
+          <span class="toggle-text" id="toggleText">Ellenfél kezd</span>
+        </label>
+        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);margin-top:8px;line-height:1.6;">
+          Ha én kezdek, az ellenfél<br>paritása ismeretlen marad.
+        </div>
+      </div>
 
       <!-- 1. lépés: Ellenfél lépése -->
       <div class="panel" style="padding:16px;">
@@ -130,6 +147,14 @@
 
   </div><!-- /main-grid -->
 </div><!-- /app -->
+
+<!-- Toggle szöveg frissítése JS-ből -->
+<script>
+  document.getElementById('chkIStart').addEventListener('change', function() {
+    document.getElementById('toggleText').textContent =
+      this.checked ? 'Én kezdem' : 'Ellenfél kezd';
+  });
+</script>
 
 <!-- JavaScript -->
 <script src="app.js"></script>
