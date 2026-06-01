@@ -1,13 +1,15 @@
 // =============================================
-//  LÁTÓK PÁRBAJA — ORACLE HELPER
-//  app.js  (v2.0 — Multiverzum Logika + % Mutató)
+//  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ AI
+//  app.js (v3.0)
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 let myCards = [...ALL_CARDS]; 
-// Multiverzum állapot: Az összes lehetséges pakli kombinációjának tömbje
 let possibleEnemyHands = [ [...ALL_CARDS] ]; 
+
+let myScore = 0;
+let enemyScore = 0;
 
 let selectedMine   = null;   
 let selectedEnemy  = null;   
@@ -17,9 +19,6 @@ let iStarted       = false;
 let history  = [];
 let roundNum = 0;
 
-// =============================================
-//  INIT
-// =============================================
 function init() {
   const chk = document.getElementById('chkIStart');
   if (chk) {
@@ -28,6 +27,7 @@ function init() {
       updateChips();
     });
   }
+  updateScoreBoard();
   renderMyCards();
   renderEnemyCards();
   renderOracle();
@@ -36,42 +36,95 @@ function init() {
 }
 
 // =============================================
-//  SEGÉDFÜGGVÉNYEK A MULTIVERZUMHOZ
+//  DINAMIKUS VALÓSZÍNŰSÉG SZÁMÍTÓ MOTOR
 // =============================================
-
-// Visszaadja az összes olyan lapot (egyedi listaként), ami BÁRMELYIK lehetséges pakliban benne van
-function getPossibleEnemyCards() {
-  if (possibleEnemyHands.length === 0) return [];
-  return [...new Set(possibleEnemyHands.flat())].sort((a,b) => a - b);
-}
-
-// Kiszámolja, hogy az adott lap hány százalékban nyerne az aktuális lehetséges univerzumok ellen
-function calcWinChance(myCard) {
-  if (possibleEnemyHands.length === 0) return 0;
-  let totalWins = 0;
-  let totalCardsToFace = 0;
+function getActiveEnemyCardProbabilities() {
+  let cardCounts = {};
+  let total = 0;
+  
+  // Ha ki van választva a paritás, azonnal csak azokra szűrünk!
+  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0) :
+                   selectedEnemy === 'odd'  ? (c => c % 2 !== 0) :
+                   (c => true);
 
   possibleEnemyHands.forEach(hand => {
-    totalWins += hand.filter(ec => ec < myCard).length;
-    totalCardsToFace += hand.length;
+    let candidates = hand.filter(parityOk);
+    candidates.forEach(c => {
+       cardCounts[c] = (cardCounts[c] || 0) + 1;
+       total++;
+    });
   });
-
-  return Math.round((totalWins / totalCardsToFace) * 100);
+  return { cardCounts, total };
 }
 
-// Kiszámolja, hány százalék eséllyel van még bent egy adott lap az ellenfélnél
+function calcRoundStats(myCard) {
+  let { cardCounts, total } = getActiveEnemyCardProbabilities();
+  if (total === 0) return { win: 0, lose: 0, draw: 0 };
+  
+  let w = 0, l = 0, d = 0;
+  for (let c in cardCounts) {
+    c = parseInt(c);
+    if (myCard > c) w += cardCounts[c];
+    else if (myCard < c) l += cardCounts[c];
+    else d += cardCounts[c];
+  }
+  return {
+    win: Math.round((w/total)*100),
+    lose: Math.round((l/total)*100),
+    draw: Math.round((d/total)*100)
+  };
+}
+
 function calcEnemyCardChance(card) {
-  if (possibleEnemyHands.length === 0) return 0;
-  let count = 0;
-  possibleEnemyHands.forEach(hand => {
-    if (hand.includes(card)) count++;
-  });
-  return Math.round((count / possibleEnemyHands.length) * 100);
+  let { cardCounts, total } = getActiveEnemyCardProbabilities();
+  if (total === 0) return 0;
+  return Math.round(((cardCounts[card] || 0) / total) * 100);
 }
 
 // =============================================
-//  RENDER MY CARDS 
+//  RENDER FUNCTIONS
 // =============================================
+function updateScoreBoard() {
+  document.getElementById('scoreMine').textContent = myScore;
+  document.getElementById('scoreEnemy').textContent = enemyScore;
+
+  let diff = myScore - enemyScore;
+  let diffEl = document.getElementById('scoreDiff');
+
+  if (diff > 0) {
+    diffEl.textContent = `Vezetsz: +${diff}`;
+    diffEl.style.color = 'var(--emerald-light)';
+    diffEl.style.borderColor = 'var(--emerald)';
+  } else if (diff < 0) {
+    diffEl.textContent = `Hátrány: ${diff}`;
+    diffEl.style.color = 'var(--crimson-light)';
+    diffEl.style.borderColor = 'var(--crimson)';
+  } else {
+    diffEl.textContent = `Döntetlen`;
+    diffEl.style.color = 'var(--text-dim)';
+    diffEl.style.borderColor = 'var(--border)';
+  }
+
+  let finalProj = document.getElementById('finalScoreProj');
+  if (myCards.length === 0) {
+    if (myScore > enemyScore) {
+       let final = myScore + diff;
+       finalProj.innerHTML = `🏆 Játék vége! Győzelem! Végső pontszám: <strong style="color:var(--emerald-light); font-size:16px;">${final}</strong>`;
+    } else if (enemyScore > myScore) {
+       finalProj.innerHTML = `💀 Játék vége! Vereség.`;
+    } else {
+       finalProj.innerHTML = `🤝 Játék vége! Döntetlen.`;
+    }
+  } else {
+    if (myScore > enemyScore) {
+       let projected = myScore + diff;
+       finalProj.innerHTML = `Ha most nyernél, a végső pontod: <strong style="color:var(--gold-light); font-size:15px;">${projected}</strong> lenne.`;
+    } else {
+       finalProj.innerHTML = `Várható végeredmény: <span style="color:var(--text-dim)">Jelenleg nincs bónusz pont.</span>`;
+    }
+  }
+}
+
 function renderMyCards() {
   const container = document.getElementById('myCardsRow');
   container.innerHTML = '';
@@ -83,19 +136,12 @@ function renderMyCards() {
   evenRow.className = 'cards-sub-row';
 
   ALL_CARDS.forEach(n => {
-    const isEven     = n % 2 === 0;
-    const inHand     = myCards.includes(n);
+    const isEven = n % 2 === 0;
+    const inHand = myCards.includes(n);
     const isSelected = n === selectedMine;
 
     const btn = document.createElement('button');
-    btn.className = [
-      'card-btn',
-      isEven ? 'even' : 'odd',
-      !inHand    ? 'used' : '',
-      isSelected ? 'selected-mine' : ''
-    ].join(' ').trim();
-
-    btn.setAttribute('data-num', n);
+    btn.className = ['card-btn', isEven ? 'even' : 'odd', !inHand ? 'used' : '', isSelected ? 'selected-mine' : ''].join(' ').trim();
     btn.disabled = !inHand;
 
     const numSpan = document.createElement('span');
@@ -105,22 +151,22 @@ function renderMyCards() {
 
     const badge = document.createElement('div');
     badge.className = 'badge';
-    const pct = calcWinChance(n);
+    
+    // A kiválasztott paritás alapján élőben számoljuk a %-ot!
+    const stats = calcRoundStats(n);
+    const pct = stats.win;
 
     if (inHand) {
-      badge.textContent = pct !== null ? pct + '%' : '?';
-      if (pct === 100)    badge.classList.add('chance-100');
+      badge.textContent = pct + '%';
+      if (pct === 100) badge.classList.add('chance-100');
       else if (pct >= 60) badge.classList.add('chance-high');
     } else {
-      badge.textContent   = '—';
+      badge.textContent = '—';
       badge.style.opacity = '0.3';
     }
     btn.appendChild(badge);
 
-    if (inHand) {
-      btn.onclick = () => selectMyCard(n);
-    }
-
+    if (inHand) btn.onclick = () => selectMyCard(n);
     if (isEven) evenRow.appendChild(btn);
     else oddRow.appendChild(btn);
   });
@@ -129,50 +175,28 @@ function renderMyCards() {
   container.appendChild(evenRow);
 }
 
-// =============================================
-//  RENDER ENEMY CARDS — + Százalékos mutató
-// =============================================
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
   container.innerHTML = '';
 
-  const oddLabel  = document.createElement('div');
-  oddLabel.className = 'cards-row-label';
-  oddLabel.textContent = '⬜ Páratlan';
-
-  const evenLabel = document.createElement('div');
-  evenLabel.className = 'cards-row-label';
-  evenLabel.textContent = '⬛ Páros';
-
-  const oddRow  = document.createElement('div');
-  oddRow.className = 'cards-sub-row';
-
-  const evenRow = document.createElement('div');
-  evenRow.className = 'cards-sub-row';
-
-  const currentPossibleCards = getPossibleEnemyCards();
+  const oddRow  = document.createElement('div'); oddRow.className = 'cards-sub-row';
+  const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
   ALL_CARDS.forEach(n => {
-    const isEven   = n % 2 === 0;
-    const possible = currentPossibleCards.includes(n);
-    const chance   = calcEnemyCardChance(n);
+    const isEven = n % 2 === 0;
+    const chance = calcEnemyCardChance(n);
+    const possible = chance > 0;
 
     const slot = document.createElement('div');
-    slot.className = [
-      'enemy-card-slot',
-      isEven ? 'enemy-even' : 'enemy-odd',
-      possible ? 'possible' : 'eliminated'
-    ].join(' ');
+    slot.className = ['enemy-card-slot', isEven ? 'enemy-even' : 'enemy-odd', possible ? 'possible' : 'eliminated'].join(' ');
 
     const numSpan = document.createElement('span');
     numSpan.textContent = n;
     slot.appendChild(numSpan);
 
-    // Százalék kiírása, ha a lap még lehetséges
     if (possible) {
       const chanceDiv = document.createElement('div');
       chanceDiv.className = 'enemy-chance';
-      
       if (chance === 100) {
         chanceDiv.classList.add('sure-chance');
         chanceDiv.textContent = '100%';
@@ -181,7 +205,6 @@ function renderEnemyCards() {
         else if (chance <= 30) chanceDiv.classList.add('low-chance');
         chanceDiv.textContent = chance + '%';
       }
-      
       slot.appendChild(chanceDiv);
     }
 
@@ -189,32 +212,40 @@ function renderEnemyCards() {
     else oddRow.appendChild(slot);
   });
 
-  container.appendChild(oddLabel);
   container.appendChild(oddRow);
-  container.appendChild(evenLabel);
   container.appendChild(evenRow);
-
-  const cardsLeftInDeck = possibleEnemyHands.length > 0 ? possibleEnemyHands[0].length : 0;
-  document.getElementById('enemyCount').textContent =
-    `Pakli: ${cardsLeftInDeck} lap | Univerzumok: ${possibleEnemyHands.length}`;
 }
 
 // =============================================
-//  ORACLE / HELPER LOGIC
+//  ORACLE AI - PONTMAXIMALIZÁLÓ HEURISZTIKA
 // =============================================
 function getBestCard() {
   if (myCards.length === 0) return null;
   let best = null;
-  let bestScore = -1;
+  let bestStrategyScore = -Infinity;
 
   myCards.forEach(c => {
-    const pct = calcWinChance(c);
-    const infoScore = 100 - Math.abs(pct - 50); // Információs érték: medián felé húz
-    const score = pct * 10 + infoScore; 
-    if (score > bestScore) {
-      bestScore = score;
-      best = c;
-    }
+     let s = calcRoundStats(c);
+     let score = 0;
+
+     if (s.win >= 70) {
+       // Biztos győzelem. A LEGKISEBB ilyen kártyát javasoljuk, hogy spóroljunk a nagyokkal!
+       score = 10000 - c * 10 + s.win;
+     } else if (s.win >= 40) {
+       // Megküzdött kör.
+       score = 5000 + s.win * 10 - c;
+     } else if (s.draw >= 50) {
+       // Döntetlen kimentése.
+       score = 3000 + s.draw * 10 - c;
+     } else {
+       // Elvesztett kör. Szabaduljunk meg a LEGKISEBB lapunktól.
+       score = 1000 - c * 10;
+     }
+
+     if (score > bestStrategyScore) {
+       bestStrategyScore = score;
+       best = c;
+     }
   });
   return best;
 }
@@ -223,80 +254,70 @@ function renderOracle() {
   const body = document.getElementById('oracleBody');
 
   if (myCards.length === 0) {
-    body.innerHTML = `<div class="oracle-text"><div class="oracle-main-text">Nincs több lap a kezedben.</div></div>`;
+    body.innerHTML = `<div class="oracle-text"><div class="oracle-main-text">Játék vége!</div></div>`;
     return;
   }
 
   const isFirstMove = roundNum === 0 && selectedMine === null;
 
   let suggestedCard;
-  if (isFirstMove) {
+  if (isFirstMove && !selectedEnemy) {
     suggestedCard = myCards.includes(4) ? 4 : (myCards.includes(5) ? 5 : getBestCard());
   } else {
     suggestedCard = getBestCard();
   }
 
-  if (suggestedCard === null) { body.innerHTML = ''; return; }
+  if (suggestedCard === null) return;
 
-  const isEven  = suggestedCard % 2 === 0;
-  const winPct  = calcWinChance(suggestedCard);
+  const isEven = suggestedCard % 2 === 0;
+  const s = calcRoundStats(suggestedCard);
   
-  // Veszítés és döntetlen kiszámítása az összes univerzumból
-  let totalLose = 0, totalDraw = 0, totalCards = 0;
-  possibleEnemyHands.forEach(hand => {
-    totalLose += hand.filter(ec => ec > suggestedCard).length;
-    totalDraw += hand.filter(ec => ec === suggestedCard).length;
-    totalCards += hand.length;
-  });
-  const losePct = Math.round((totalLose / totalCards) * 100);
-  const drawPct = Math.round((totalDraw / totalCards) * 100);
+  let strategyDesc = "";
+  if (isFirstMove && !selectedEnemy) {
+     strategyDesc = `Nyitólap a <strong>${suggestedCard}</strong>-es — információszerzés céljából a legjobb. (Utána térünk át a pontmaximalizálásra!)`;
+  } else {
+     if (s.win >= 70) {
+       strategyDesc = `A <strong>${suggestedCard}</strong>-es a legkisebb lapod, amivel szinte biztosan (<strong>${s.win}%</strong>) pontot rabolhatsz.`;
+     } else if (s.win >= 40) {
+       strategyDesc = `A <strong>${suggestedCard}</strong>-es lap a legjobb kompromisszum a pontszerzésre (<strong>${s.win}%</strong> nyerési esély).`;
+     } else if (s.draw >= 50) {
+       strategyDesc = `Valószínűleg hátrányban vagyunk. A <strong>${suggestedCard}</strong>-es lappal nagy eséllyel (<strong>${s.draw}%</strong>) kimenthetünk egy döntetlent!`;
+     } else {
+       strategyDesc = `Az ellenfélnek valószínűleg erős lapja van. Dobd be a <strong>${suggestedCard}</strong>-est (legkisebb lapod), hogy minimalizáld a veszteséget!`;
+     }
+  }
 
-  const cardStats = myCards
-    .map(c => ({ card: c, pct: calcWinChance(c) }))
-    .sort((a, b) => b.pct - a.pct)
-    .slice(0, 4);
+  const winColor = s.win >= 60 ? 'stat-val-green' : s.win >= 40 ? 'stat-val-gold' : 'stat-val-red';
 
-  const reasonText = isFirstMove
-    ? `Nyitólap a <strong>${suggestedCard}</strong>-es — ez a mediáns lap, amely információs szempontból a legtökéletesebben felezi meg az ellenfél halmazait.`
-    : `A <strong>${suggestedCard}</strong>-es lap nyeri a legtöbb lehetséges ellenfél-lapot (${winPct}% eséllyel).`;
-
-  const winColor = winPct >= 60 ? 'stat-val-green' : winPct >= 40 ? 'stat-val-gold' : 'stat-val-red';
-  const currentPossibleCards = getPossibleEnemyCards();
+  const cardStats = myCards.map(c => ({ card: c, s: calcRoundStats(c) })).sort((a, b) => b.s.win - a.s.win).slice(0, 4);
 
   body.innerHTML = `
     <div class="oracle-suggestion">
       <div>
-        <div class="oracle-label" style="margin-bottom:6px;">Javasolt lap</div>
-        <div class="oracle-card ${isEven ? 'oracle-even' : 'oracle-odd'}"
-             style="${!isEven ? 'color:#1a1400;' : ''}">${suggestedCard}</div>
+        <div class="oracle-card ${isEven ? 'oracle-even' : 'oracle-odd'}" style="${!isEven ? 'color:#1a1400;' : ''}">${suggestedCard}</div>
       </div>
     </div>
     <div class="oracle-text">
-      <div class="oracle-main-text">${reasonText}</div>
-      <div class="oracle-sub-text">
-        Kombinációk: ${possibleEnemyHands.length} db &nbsp;|&nbsp;
-        Gyanúsítottak: ${currentPossibleCards.join(', ')} &nbsp;|&nbsp;
-        Saját kezem: ${myCards.join(', ')}
-      </div>
+      <div class="oracle-main-text">${strategyDesc}</div>
     </div>
     <div class="oracle-stats">
       <div class="oracle-stat-row">
         <span class="stat-label">Nyerési esély</span>
-        <span class="${winColor}">${winPct}%</span>
+        <span class="${winColor}">${s.win}%</span>
       </div>
       <div class="oracle-stat-row">
         <span class="stat-label">Veszítési esély</span>
-        <span class="stat-val-red">${losePct}%</span>
+        <span class="stat-val-red">${s.lose}%</span>
       </div>
       <div class="oracle-stat-row">
         <span class="stat-label">Döntetlen esély</span>
-        <span class="stat-val-purple">${drawPct}%</span>
+        <span class="stat-val-purple">${s.draw}%</span>
       </div>
       <div style="height:1px; background:var(--border); margin:6px 0;"></div>
-      ${cardStats.map(s => `
+      ${cardStats.map(stat => `
         <div class="oracle-stat-row">
-          <span class="stat-label">Lap ${s.card}</span>
-          <span class="${s.pct === 100 ? 'stat-val-red' : s.pct >= 50 ? 'stat-val-green' : 'stat-val-gold'}">${s.pct}%</span>
+          <span class="stat-label">Lap ${stat.card}</span>
+          <span class="${stat.s.win === 100 ? 'stat-val-red' : stat.s.win >= 50 ? 'stat-val-green' : 'stat-val-gold'}">${stat.s.win}%</span>
         </div>
       `).join('')}
     </div>
@@ -320,6 +341,11 @@ function selectEnemyType(type) {
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
   updateChips();
   updateConfirmBtn();
+  
+  // ÉLŐ FRISSÍTÉS! Amint rákattintasz a paritásra, minden újra kalkulálódik!
+  renderMyCards();
+  renderEnemyCards();
+  renderOracle();
 }
 
 function selectResult(res) {
@@ -336,21 +362,11 @@ function updateChips() {
   const ce = document.getElementById('chip-enemy');
   const cr = document.getElementById('chip-result');
 
-  if (selectedMine !== null) {
-    cm.textContent = `Lapom: ${selectedMine}`;
-    cm.className   = 'status-chip chip-mine';
-  } else {
-    cm.textContent = 'Lapom: —';
-    cm.className   = 'status-chip chip-none';
-  }
+  cm.textContent = selectedMine !== null ? `Lapom: ${selectedMine}` : 'Lapom: —';
+  cm.className   = selectedMine !== null ? 'status-chip chip-mine' : 'status-chip chip-none';
 
-  if (selectedEnemy) {
-    ce.textContent = selectedEnemy === 'even' ? 'Ellenfél: Páros' : 'Ellenfél: Páratlan';
-    ce.className   = 'status-chip chip-enemy';
-  } else {
-    ce.textContent = 'Ellenfél: —';
-    ce.className   = 'status-chip chip-none';
-  }
+  ce.textContent = selectedEnemy ? (selectedEnemy === 'even' ? 'Ellenfél: Páros' : 'Ellenfél: Páratlan') : 'Ellenfél: —';
+  ce.className   = selectedEnemy ? 'status-chip chip-enemy' : 'status-chip chip-none';
 
   if (selectedResult) {
     const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
@@ -366,16 +382,10 @@ function updateChips() {
 function updateConfirmBtn() {
   const canConfirm = selectedMine !== null && selectedEnemy !== null && selectedResult !== null;
   document.getElementById('btnConfirm').disabled = !canConfirm;
-  const hint = document.getElementById('confirmHint');
-  
-  if (!selectedMine) hint.innerHTML = 'Kattints egy lapra a sajátjaim közül';
-  else if (!selectedEnemy) hint.innerHTML = `Lap <strong style="color:var(--purple-light)">${selectedMine}</strong> kiválasztva — add meg az ellenfél paritását!`;
-  else if (!selectedResult) hint.innerHTML = 'Add meg a kör eredményét';
-  else hint.innerHTML = `<span style="color:var(--emerald-light)">✓ Kész a megerősítésre</span>`;
 }
 
 // =============================================
-//  DEDUCTION LOGIC — A Multiverzum Létrehozása
+//  DEDUCTION LOGIC
 // =============================================
 function deduceEnemyHands(myCard, enemyType, result) {
   let newHandsSet = new Set();
@@ -397,7 +407,7 @@ function deduceEnemyHands(myCard, enemyType, result) {
   let newHands = [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
 
   if (newHands.length === 0) {
-    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Kérlek ellenőrizd, mit kattintottál.");
+    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Biztos jó adatot adtál meg?");
     return possibleEnemyHands; 
   }
 
@@ -413,12 +423,18 @@ function confirmRound() {
   history.push({
     myCards: [...myCards],
     possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
+    myScore,
+    enemyScore,
     selectedMine,
     selectedEnemy,
     selectedResult,
     iStarted,
     roundNum
   });
+
+  // Pontok számolása
+  if (selectedResult === 'win') myScore++;
+  else if (selectedResult === 'lose') enemyScore++;
 
   possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
   myCards = myCards.filter(c => c !== selectedMine);
@@ -435,6 +451,7 @@ function confirmRound() {
   selectedResult = null;
 
   clearActionButtons();
+  updateScoreBoard();
   renderMyCards();
   renderEnemyCards();
   renderOracle();
@@ -443,21 +460,15 @@ function confirmRound() {
 }
 
 // =============================================
-//  HISTORY LOG
+//  HISTORY & UNDO
 // =============================================
 function addHistoryEntry(round, mine, enemy, result, cls) {
-  const list  = document.getElementById('historyList');
-  const empty = list.querySelector('.history-empty');
-  if (empty) empty.remove();
+  const list = document.getElementById('historyList');
+  if (list.querySelector('.history-empty')) list.innerHTML = '';
 
   const entry = document.createElement('div');
   entry.className = 'history-entry';
-  entry.innerHTML = `
-    <span class="h-round">#${round}</span>
-    <span class="h-mine">Én: ${mine}</span>
-    <span class="h-enemy">Ell: ${enemy}</span>
-    <span class="${cls}">${result}</span>
-  `;
+  entry.innerHTML = `<span class="h-round">#${round}</span> <span class="h-mine">Én: ${mine}</span> <span class="h-enemy">Ell: ${enemy}</span> <span class="${cls}">${result}</span>`;
   list.appendChild(entry);
 }
 
@@ -476,72 +487,35 @@ function renderHistory() {
   });
 }
 
-// =============================================
-//  UNDO — Backspace
-// =============================================
 function undoLast() {
   if (history.length === 0) return;
-
   const snap = history.pop();
   myCards = snap.myCards;
   possibleEnemyHands = snap.possibleEnemyHands;
+  myScore = snap.myScore;
+  enemyScore = snap.enemyScore;
   roundNum = snap.roundNum;
 
-  selectedMine   = null;
-  selectedEnemy  = null;
-  selectedResult = null;
-
-  clearActionButtons();
-  renderHistory();
-  renderMyCards();
-  renderEnemyCards();
-  renderOracle();
-  updateConfirmBtn();
-  updateChips();
+  selectedMine = null; selectedEnemy = null; selectedResult = null;
+  clearActionButtons(); updateScoreBoard(); renderHistory(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips();
 }
 
-// =============================================
-//  FULL RESET — ESC
-// =============================================
 function resetAll() {
-  myCards = [...ALL_CARDS];
-  possibleEnemyHands = [ [...ALL_CARDS] ];
-  history = [];
-  roundNum = 0;
+  myCards = [...ALL_CARDS]; possibleEnemyHands = [ [...ALL_CARDS] ]; history = []; roundNum = 0;
+  myScore = 0; enemyScore = 0;
+  selectedMine = null; selectedEnemy = null; selectedResult = null;
 
-  selectedMine   = null;
-  selectedEnemy  = null;
-  selectedResult = null;
-
-  const chk = document.getElementById('chkIStart');
-  if (chk) chk.checked = false;
-  iStarted = false;
-
-  clearActionButtons();
-  renderMyCards();
-  renderEnemyCards();
-  renderOracle();
-  updateConfirmBtn();
-  updateChips();
-  renderHistory();
+  const chk = document.getElementById('chkIStart'); if (chk) chk.checked = false; iStarted = false;
+  clearActionButtons(); updateScoreBoard(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips(); renderHistory();
 }
 
 function clearActionButtons() {
-  ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id => {
-    document.getElementById(id).classList.remove('active');
-  });
+  ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id => document.getElementById(id).classList.remove('active'));
 }
 
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    resetAll();
-  } else if (e.key === 'Backspace') {
-    if (document.activeElement.tagName !== 'INPUT') {
-      e.preventDefault();
-      undoLast();
-    }
-  }
+  if (e.key === 'Escape') { e.preventDefault(); resetAll(); }
+  else if (e.key === 'Backspace' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); undoLast(); }
 });
 
 init();
