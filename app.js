@@ -161,6 +161,12 @@ function renderMyCards() {
   const oddRow = document.createElement('div'); oddRow.className = 'cards-sub-row';
   const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
+  // EV számítás az összes lapra (cache-elt)
+  const allEVs = getAllCardEVs();
+  const evMap = {};
+  const maxEV = allEVs.length > 0 ? Math.max(...allEVs.map(x => x.ev)) : 0;
+  allEVs.forEach(x => { evMap[x.card] = x; });
+
   ALL_CARDS.forEach(n => {
     const isEven = n % 2 === 0;
     const inHand = myCards.includes(n);
@@ -177,23 +183,24 @@ function renderMyCards() {
 
     const badge = document.createElement('div');
     badge.className = 'badge';
-    
-    const stats = calcRoundStats(n);
-    const pct = stats.win;
 
-    if (inHand) {
+    if (inHand && evMap[n] !== undefined) {
+      const ev = evMap[n].ev;
+      const isOptimal = maxEV > 0 && ev === maxEV;
+      badge.textContent = ev.toFixed(1);
+      if (isOptimal) badge.classList.add('chance-100');
+      else if (ev >= maxEV * 0.85) badge.classList.add('chance-high');
+    } else if (inHand) {
+      const pct = calcRoundStats(n).win;
       badge.textContent = pct + '%';
-      if (pct === 100) badge.classList.add('chance-100');
-      else if (pct >= 60) badge.classList.add('chance-high');
     } else {
       badge.textContent = '—';
       badge.style.opacity = '0.3';
     }
     btn.appendChild(badge);
 
-    // Kézi felülbírálás lehetősége
     if (inHand) btn.onclick = () => selectMyCard(n);
-    
+
     if (isEven) evenRow.appendChild(btn);
     else oddRow.appendChild(btn);
   });
@@ -244,37 +251,196 @@ function renderEnemyCards() {
 }
 
 // =============================================
-//  ORACLE AI - AGRESSZÍV PONTMAXIMALIZÁLÓ
+//  ORACLE AI v5.0 — BITMASK EXPECTED VALUE ENGINE
+//  Teljes játék-aware minimax + memoizáció
+//  Bitmask state: minden lap = 1 bit (0..8 = 9 bit)
 // =============================================
+
+/**
+ * Bitmask segédeszközök
+ */
+const FULL_MASK = (1 << 9) - 1; // 0b111111111 = 511
+
+function maskToArray(mask) {
+  const arr = [];
+  for (let i = 0; i <= 8; i++) { if (mask & (1 << i)) arr.push(i); }
+  return arr;
+}
+
+function arrayToMask(arr) {
+  return arr.reduce((m, c) => m | (1 << c), 0);
+}
+
+function maskCount(mask) {
+  let n = 0, tmp = mask;
+  while (tmp) { n += tmp & 1; tmp >>= 1; }
+  return n;
+}
+
+/**
+ * Memoizációs cache.
+ * Key: integer = myMask * 2^18 + enemyMask * 2^8 + myS * 16 + enemyS
+ * (myS, enemyS max 9 → belefér 4 bitbe)
+ */
+let evCache = new Map();
+
+function makeKey(myMask, enemyMask, myS, enemyS) {
+  // myMask: 9 bit (0-511), enemyMask: 9 bit, myS: 4 bit (0-9), enemyS: 4 bit
+  return (myMask << 22) | (enemyMask << 13) | (myS << 6) | (enemyS << 0);
+}
+
+function clearEvCache() {
+  evCache.clear();
+}
+
+/**
+ * Várható saját végső pontszám kiszámítása.
+ *
+ * Modell: az ellenfél minden lehetséges lapját egyenlő valószínűséggel
+ * feltételezzük (uniform prior a fennmaradó lapokon belül).
+ * Mi optimálisan (EV-maximalizálva) választunk.
+ *
+ * @param {number} myMask     - Saját kézben lévő lapok bitmaskja
+ * @param {number} enemyMask  - Ellenfél lehetséges lapjainak bitmaskja
+ * @param {number} myS        - Jelenlegi saját pontszám
+ * @param {number} enemyS     - Jelenlegi ellenfél pontszám
+ * @returns {{ ev: number, bestCard: number }}
+ */
+function computeEV(myMask, enemyMask, myS, enemyS) {
+  // Bázis eset: nincs több saját lap
+  if (myMask === 0) {
+    const diff = myS - enemyS;
+    return { ev: diff > 0 ? myS + diff : 0, bestCard: -1 };
+  }
+
+  const key = makeKey(myMask, enemyMask, myS, enemyS);
+  if (evCache.has(key)) return evCache.get(key);
+
+  const enemyCount = maskCount(enemyMask);
+  let bestEV = -Infinity;
+  let bestCard = -1;
+
+  for (let myCard = 0; myCard <= 8; myCard++) {
+    if (!(myMask & (1 << myCard))) continue;
+    const nextMyMask = myMask ^ (1 << myCard);
+
+    let totalEV = 0;
+
+    if (enemyCount === 0) {
+      // Nincs ellenfél lap — a mostani állás a végső
+      const diff = myS - enemyS;
+      totalEV = diff > 0 ? myS + diff : 0;
+    } else {
+      // Átlagolunk az összes lehetséges ellenfél-lapra (uniform)
+      for (let ec = 0; ec <= 8; ec++) {
+        if (!(enemyMask & (1 << ec))) continue;
+        let newMyS = myS, newEnemyS = enemyS;
+        if (myCard > ec) newMyS++;
+        else if (myCard < ec) newEnemyS++;
+        const nextEnemyMask = enemyMask ^ (1 << ec);
+        const { ev: subEV } = computeEV(nextMyMask, nextEnemyMask, newMyS, newEnemyS);
+        totalEV += subEV;
+      }
+      totalEV /= enemyCount;
+    }
+
+    if (totalEV > bestEV || (totalEV === bestEV && myCard < bestCard)) {
+      bestEV = totalEV;
+      bestCard = myCard;
+    }
+  }
+
+  const result = { ev: bestEV, bestCard };
+  evCache.set(key, result);
+  return result;
+}
+
+/**
+ * Az aktuális game state-ből kiszámolja minden kézben lévő lapunkhoz
+ * a várható végpontszámot (EV), figyelembe véve a selectedEnemy paritást.
+ *
+ * @returns {Array<{ card, ev, win, lose, draw }>} — EV szerint csökkentően rendezve
+ */
+function getAllCardEVs() {
+  if (myCards.length === 0) return [];
+
+  const myMask = arrayToMask(myCards);
+
+  // Ellenfél lehetséges lapjainak bitmask-ja, paritás-szűréssel
+  let rawEnemyMask = 0;
+  for (const hand of possibleEnemyHands) {
+    for (const c of hand) rawEnemyMask |= (1 << c);
+  }
+
+  // Paritás-szűrés
+  let enemyMask = rawEnemyMask;
+  if (selectedEnemy === 'even') {
+    // Csak páros bitek (0,2,4,6,8)
+    enemyMask &= (1<<0)|(1<<2)|(1<<4)|(1<<6)|(1<<8);
+  } else if (selectedEnemy === 'odd') {
+    // Csak páratlan bitek (1,3,5,7)
+    enemyMask &= (1<<1)|(1<<3)|(1<<5)|(1<<7);
+  }
+
+  return myCards.map(card => {
+    const cardBit = 1 << card;
+    const nextMyMask = myMask ^ cardBit;
+
+    // Kör-szintű statisztikák (UI-hoz)
+    const roundStats = calcRoundStats(card);
+
+    // EV: mi a legjobb várható végpont, ha ezt a lapot dobjuk?
+    // Átlagolunk az összes lehetséges ellenfél-lapra
+    const enemyCount = maskCount(enemyMask);
+    let totalEV = 0;
+
+    if (enemyCount === 0) {
+      const diff = myScore - enemyScore;
+      totalEV = diff > 0 ? myScore + diff : 0;
+    } else {
+      for (let ec = 0; ec <= 8; ec++) {
+        if (!(enemyMask & (1 << ec))) continue;
+        let newMyS = myScore, newEnemyS = enemyScore;
+        if (card > ec) newMyS++;
+        else if (card < ec) newEnemyS++;
+        const nextEnemyMask = enemyMask ^ (1 << ec);
+        const { ev: subEV } = computeEV(nextMyMask, nextEnemyMask, newMyS, newEnemyS);
+        totalEV += subEV;
+      }
+      totalEV /= enemyCount;
+    }
+
+    return { card, ev: totalEV, ...roundStats };
+  }).sort((a, b) => b.ev - a.ev || a.card - b.card);
+}
+
+/**
+ * Visszaadja a legjobb lapot EV alapján.
+ */
 function getBestCard() {
   if (myCards.length === 0) return null;
-  
-  let stats = myCards.map(c => ({ card: c, s: calcRoundStats(c) }));
-  
-  // 1. Biztos Pontszerzők (Nyerési esély >= 60%)
-  let solidWinners = stats.filter(item => item.s.win >= 60);
-  if (solidWinners.length > 0) {
-      solidWinners.sort((a, b) => a.card - b.card);
-      return solidWinners[0].card;
-  }
+  clearEvCache();
+  const cardEVs = getAllCardEVs();
+  if (cardEVs.length === 0) return myCards[0];
+  return cardEVs[0].card;
+}
 
-  // 2. Kockázatos, de esélyes (Nyerési esély >= 40%)
-  let possibleWinners = stats.filter(item => item.s.win >= 40);
-  if (possibleWinners.length > 0) {
-      possibleWinners.sort((a, b) => a.card - b.card);
-      return possibleWinners[0].card;
-  }
-
-  // 3. Döntetlen kimentése
-  let drawSavers = stats.filter(item => item.s.draw >= 50);
-  if (drawSavers.length > 0) {
-      drawSavers.sort((a, b) => a.card - b.card);
-      return drawSavers[0].card;
-  }
-
-  // 4. Taktikai Áldozat (Legkisebb lap)
-  let sortedByValue = [...myCards].sort((a, b) => a - b);
-  return sortedByValue[0];
+/**
+ * Részletes EV-elemzés a renderOracle()-hoz.
+ */
+function getBestCardWithAnalysis() {
+  if (myCards.length === 0) return null;
+  clearEvCache();
+  const cardEVs = getAllCardEVs();
+  if (cardEVs.length === 0) return { card: myCards[0], ev: 0, win: 0, lose: 0, draw: 0, allEVs: [] };
+  return {
+    card:    cardEVs[0].card,
+    ev:      cardEVs[0].ev,
+    win:     cardEVs[0].win,
+    lose:    cardEVs[0].lose,
+    draw:    cardEVs[0].draw,
+    allEVs:  cardEVs
+  };
 }
 
 function renderOracle() {
@@ -285,25 +451,48 @@ function renderOracle() {
     return;
   }
 
-  let suggestedCard = getBestCard();
-  if (suggestedCard === null) return;
+  const analysis = getBestCardWithAnalysis();
+  if (!analysis) return;
 
+  const { card: suggestedCard, ev, win, lose, draw, allEVs } = analysis;
   const isEven = suggestedCard % 2 === 0;
-  const s = calcRoundStats(suggestedCard);
-  
+
+  // ── Stratégiai leírás EV-alapon ──
+  const remainingRounds = myCards.length;
+  const scoreDiff = myScore - enemyScore;
+
   let strategyDesc = "";
-  if (s.win >= 60) {
-     strategyDesc = `🔥 <strong>TÁMADÁS:</strong> A <strong>${suggestedCard}</strong>-es a legkisebb lapod, amivel már nagyon magas (<strong>${s.win}%</strong>) eséllyel pontot szerzel. A nagyobb lapjaidat megspórolod későbbre!`;
-  } else if (s.win >= 40) {
-     strategyDesc = `⚖️ <strong>KIEGYENLÍTETT:</strong> A <strong>${suggestedCard}</strong>-es lap a legjobb kompromisszum. Van esély a pontra (<strong>${s.win}%</strong>), de nem fáj annyira, ha mégis elbukjuk.`;
-  } else if (s.draw >= 50) {
-     strategyDesc = `🛡️ <strong>VÉDEKEZÉS:</strong> A <strong>${suggestedCard}</strong>-es lappal jó eséllyel (<strong>${s.draw}%</strong>) kimentünk egy döntetlent.`;
+
+  if (iStarted && !selectedEnemy) {
+    // Vak nyitás
+    if (ev > myScore + 2) {
+      strategyDesc = `🎯 <strong>VAK NYITÁS:</strong> A <strong>${suggestedCard}</strong>-es a legmagasabb várható végpontszámot (<strong>${ev.toFixed(2)}</strong>) adja vak nyitásnál. Az ellenfél valószínűleg elpazarol erre egy erős lapot.`;
+    } else {
+      strategyDesc = `🎭 <strong>VAK TAKTIKA:</strong> Teljes bizonytalanság — a <strong>${suggestedCard}</strong>-es adja a legjobb várható végeredményt (<strong>${ev.toFixed(2)} pont</strong>) az összes lehetséges ellenfél-lapra nézve.`;
+    }
+  } else if (win >= 80) {
+    strategyDesc = `🔥 <strong>BIZTOS PONT:</strong> A <strong>${suggestedCard}</strong>-es <strong>${win}%</strong> eséllyel nyer, és a várható végpontszámod <strong>${ev.toFixed(2)}</strong>. Ezt a kört elviszed.`;
+  } else if (scoreDiff >= 2 && remainingRounds <= 3) {
+    // Vezet, kevés kör van — védekező stratégia
+    strategyDesc = `🛡️ <strong>ELŐNY MEGTARTÁSA:</strong> Vezetsz +${scoreDiff}-vel, ${remainingRounds} kör van hátra. A <strong>${suggestedCard}</strong>-es minimalizálja a kockázatot, várható pontod: <strong>${ev.toFixed(2)}</strong>.`;
+  } else if (scoreDiff <= -2 && remainingRounds <= 3) {
+    // Lemarad, kevés kör — kockázatos, de szükséges
+    strategyDesc = `⚡ <strong>VISSZATÁMADÁS:</strong> Lemaradsz ${Math.abs(scoreDiff)}-vel, csak ${remainingRounds} kör maradt! A <strong>${suggestedCard}</strong>-es adja a legjobb esélyt a fordulatra (<strong>${ev.toFixed(2)} várható pont</strong>).`;
+  } else if (win >= 50) {
+    strategyDesc = `⚔️ <strong>ELŐNYÖS ÁLLÁS:</strong> A <strong>${suggestedCard}</strong>-es <strong>${win}%</strong> nyerési eséllyel a legjobb várható végpontszámot (<strong>${ev.toFixed(2)}</strong>) hozza.`;
+  } else if (draw >= 40 && scoreDiff > 0) {
+    strategyDesc = `🤝 <strong>DÖNTETLEN VÉD:</strong> Vezetsz, ezért a <strong>${suggestedCard}</strong>-es döntetlennel való kimentése (<strong>${draw}%</strong>) is értékes — várható pont: <strong>${ev.toFixed(2)}</strong>.`;
+  } else if (win < 30 && lose > 50) {
+    strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Nincs nyerő lapod. A <strong>${suggestedCard}</strong>-est vesd oda — az ellenfél elpazarol egy nagy lapot, várható végponted: <strong>${ev.toFixed(2)}</strong>.`;
   } else {
-     strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Nincs jó nyerő lapod. Dobd be a <strong>${suggestedCard}</strong>-est (a legkisebbet), hogy az ellenfél elpazarolja az egyik nagy lapját!`;
+    strategyDesc = `⚖️ <strong>OPTIMÁLIS:</strong> A <strong>${suggestedCard}</strong>-es adja a legjobb várható végpontszámot (<strong>${ev.toFixed(2)}</strong>) a teljes meccs figyelembevételével.`;
   }
 
-  const winColor = s.win >= 60 ? 'stat-val-green' : s.win >= 40 ? 'stat-val-gold' : 'stat-val-red';
-  const cardStats = myCards.map(c => ({ card: c, s: calcRoundStats(c) })).sort((a, b) => b.s.win - a.s.win).slice(0, 4);
+  const winColor = win >= 60 ? 'stat-val-green' : win >= 40 ? 'stat-val-gold' : 'stat-val-red';
+
+  // EV rangsor (top 4 lap)
+  const topEVs = allEVs.slice(0, 4);
+  const maxEV = topEVs.length > 0 ? topEVs[0].ev : 1;
 
   body.innerHTML = `
     <div class="oracle-suggestion">
@@ -316,24 +505,39 @@ function renderOracle() {
     </div>
     <div class="oracle-stats">
       <div class="oracle-stat-row">
+        <span class="stat-label">Várható végpont (EV)</span>
+        <span class="stat-val-green" style="font-weight:700;">${ev.toFixed(2)}</span>
+      </div>
+      <div class="oracle-stat-row">
         <span class="stat-label">Nyerési esély</span>
-        <span class="${winColor}">${s.win}%</span>
+        <span class="${winColor}">${win}%</span>
       </div>
       <div class="oracle-stat-row">
         <span class="stat-label">Veszítési esély</span>
-        <span class="stat-val-red">${s.lose}%</span>
+        <span class="stat-val-red">${lose}%</span>
       </div>
       <div class="oracle-stat-row">
         <span class="stat-label">Döntetlen esély</span>
-        <span class="stat-val-purple">${s.draw}%</span>
+        <span class="stat-val-purple">${draw}%</span>
       </div>
       <div style="height:1px; background:var(--border); margin:6px 0;"></div>
-      ${cardStats.map(stat => `
-        <div class="oracle-stat-row">
-          <span class="stat-label">Lap ${stat.card}</span>
-          <span class="${stat.s.win === 100 ? 'stat-val-red' : stat.s.win >= 50 ? 'stat-val-green' : 'stat-val-gold'}">${stat.s.win}%</span>
-        </div>
-      `).join('')}
+      <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);margin-bottom:4px;">EV RANGSOR (Várható Végpont)</div>
+      ${topEVs.map((item, i) => {
+        const evBarWidth = maxEV > 0 ? Math.max(0, Math.round((item.ev / maxEV) * 100)) : 0;
+        const isSelected = item.card === suggestedCard;
+        const itemIsEven = item.card % 2 === 0;
+        return `
+          <div class="oracle-stat-row" style="${isSelected ? 'background:rgba(99,60,180,0.18);border-radius:4px;padding:1px 3px;' : ''}">
+            <span class="stat-label" style="${isSelected ? 'color:var(--purple-light);font-weight:700;' : ''}">
+              ${isSelected ? '▶ ' : ''}Lap <span style="font-size:11px;padding:0 3px;border-radius:3px;background:${itemIsEven ? 'rgba(30,30,80,0.7)' : 'rgba(80,60,10,0.7)'};">${item.card}</span>
+            </span>
+            <span style="display:flex;align-items:center;gap:6px;">
+              <span style="width:${Math.max(6, evBarWidth * 0.6)}px;height:4px;background:${isSelected ? 'var(--purple-light)' : 'var(--border-glow)'};border-radius:2px;display:inline-block;"></span>
+              <span class="${isSelected ? 'stat-val-green' : 'stat-val-gold'}" style="${isSelected ? 'font-weight:700;' : ''}">${item.ev.toFixed(2)}</span>
+            </span>
+          </div>
+        `;
+      }).join('')}
     </div>
   `;
 }
@@ -465,6 +669,7 @@ function confirmRound() {
   selectedResult = null;
 
   clearActionButtons();
+  clearEvCache();
   
   autoSelectOracleCard(); // <-- AZ ÚJ AUTOMATA KIJELÖLŐ (Következő körhöz)
   
@@ -514,7 +719,8 @@ function undoLast() {
   roundNum = snap.roundNum;
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
-  clearActionButtons(); 
+  clearActionButtons();
+  clearEvCache();
   
   autoSelectOracleCard(); // Visszavonás után is automatikusan bejelöl!
   
@@ -527,7 +733,8 @@ function resetAll() {
   selectedMine = null; selectedEnemy = null; selectedResult = null;
 
   const chk = document.getElementById('chkIStart'); if (chk) chk.checked = false; iStarted = false;
-  clearActionButtons(); 
+  clearActionButtons();
+  clearEvCache();
   
   autoSelectOracleCard();
   
