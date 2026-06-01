@@ -159,7 +159,7 @@ function renderEnemyCards() {
   container.appendChild(evenRow);
 
   document.getElementById('enemyCount').textContent =
-    `Lehetséges: ${enemyCards.length} / ${ALL_CARDS.length}`;
+    `Maradt: ${enemyCards.length} lap / ${ALL_CARDS.length} összesen`;
 }
 
 // =============================================
@@ -239,7 +239,8 @@ function renderOracle() {
     <div class="oracle-text">
       <div class="oracle-main-text">${reasonText}</div>
       <div class="oracle-sub-text">
-        Ellenfél lapjai: ${enemyCards.join(', ')} (${enemyCards.length} db) &nbsp;|&nbsp;
+        Ellenfél paklijában: ${enemyCards.length} lap maradt &nbsp;|&nbsp;
+        Lehetséges lapjai: ${enemyCards.join(', ')} &nbsp;|&nbsp;
         Saját kezem: ${myCards.join(', ')} (${myCards.length} db)
       </div>
     </div>
@@ -380,56 +381,71 @@ function updateConfirmBtn() {
 }
 
 // =============================================
-//  DEDUCTION LOGIC — javított logika
+//  DEDUCTION LOGIC — helyes 1v1 logika
+//
+//  Minden körben az ellenfél PONTOSAN 1 lapot játszik ki.
+//  Azt a lapot el kell venni az ellenfél paklijából.
+//  A dedukció meghatározza MELYIK lap lehetett az,
+//  majd eltávolítja a legvalószínűbbet (középső értéket).
 //
 //  Ha ÉN KEZDTEM (iStarted = true):
-//    Csak az eredmény alapján szűrünk, paritás figyelmen kívül
-//    WIN  → ellenfél lapja < saját lapom
-//    LOSE → ellenfél lapja > saját lapom
+//    Paritás ismeretlen → az összes lehetséges lap figyelembe véve
+//    WIN  → ellenfél lapja valami volt < saját lapom
+//    LOSE → ellenfél lapja valami volt > saját lapom
 //    DRAW → ellenfél lapja = saját lapom
 //
 //  Ha AZ ELLENFÉL KEZDETT (iStarted = false):
-//    Paritás ÉS eredmény alapján szűrünk
+//    Paritás ismert → csak adott paritású lapok jönnek szóba
 //    WIN  → páros/páratlan ÉS < saját lapom
 //    LOSE → páros/páratlan ÉS > saját lapom
 //    DRAW → páros/páratlan ÉS = saját lapom
+//
+//  Az ellenfél paklijából MINDIG PONTOSAN 1 LAP KERÜL ELTÁVOLÍTÁSRA.
+//  Ha több lehetséges jelölt van, a középső értékűt vesszük el
+//  (ez adja a legjobb valószínűségi becslést).
 // =============================================
 function deduceEnemyCards(myCard, enemyType, result) {
-  let newEnemy = [...enemyCards];
+  let candidates = [...enemyCards];
 
+  // 1. Szűkítsük a jelölteket az ismert információ alapján
   if (iStarted) {
-    // --- Én kezdtem: csak értékszűrés, paritás ismeretlen ---
+    // Paritás ismeretlen — csak az eredmény alapján szűrünk
     if (result === 'win') {
-      newEnemy = newEnemy.filter(c => c < myCard);
+      candidates = candidates.filter(c => c < myCard);
     } else if (result === 'lose') {
-      newEnemy = newEnemy.filter(c => c > myCard);
+      candidates = candidates.filter(c => c > myCard);
     } else if (result === 'draw') {
-      newEnemy = newEnemy.filter(c => c === myCard);
-      // Biztonsági fallback: ha a draw lehetetlen (pl. a lap már ki lett játszva)
-      if (newEnemy.length === 0) newEnemy = [...enemyCards];
+      candidates = candidates.filter(c => c === myCard);
     }
   } else {
-    // --- Ellenfél kezdett: paritás + értékszűrés ---
-    const parityFilter = enemyType === 'even'
+    // Paritás ismert — paritás + eredmény alapján szűrünk
+    const parityOk = enemyType === 'even'
       ? (c => c % 2 === 0)
       : (c => c % 2 !== 0);
 
     if (result === 'win') {
-      newEnemy = newEnemy.filter(c => parityFilter(c) && c < myCard);
+      candidates = candidates.filter(c => parityOk(c) && c < myCard);
     } else if (result === 'lose') {
-      newEnemy = newEnemy.filter(c => parityFilter(c) && c > myCard);
+      candidates = candidates.filter(c => parityOk(c) && c > myCard);
     } else if (result === 'draw') {
-      newEnemy = newEnemy.filter(c => parityFilter(c) && c === myCard);
-      if (newEnemy.length === 0) {
-        newEnemy = enemyCards.filter(parityFilter);
-      }
+      candidates = candidates.filter(c => parityOk(c) && c === myCard);
     }
   }
 
-  // Biztonsági fallback — érvénytelen bemenetnél ne nullázódjon ki teljesen
-  if (newEnemy.length === 0) {
-    newEnemy = [...enemyCards];
+  // 2. Ha nincs jelölt (ellentmondásos adat), fallback: ne változtassunk semmit
+  if (candidates.length === 0) {
+    return [...enemyCards];
   }
+
+  // 3. Válasszuk ki, melyik lapot vesszük el az ellenfél paklijából.
+  //    A középső értékű jelöltet választjuk — ez a legjobb becslés
+  //    ha nem tudjuk pontosan melyiket játszotta ki.
+  candidates.sort((a, b) => a - b);
+  const midIndex  = Math.floor(candidates.length / 2);
+  const removedCard = candidates[midIndex];
+
+  // 4. Eltávolítjuk pontosan ezt az 1 lapot az ellenfél paklijából
+  const newEnemy = enemyCards.filter(c => c !== removedCard);
 
   return newEnemy;
 }
