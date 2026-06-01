@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Látók Párbaja — Oracle Helper</title>
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@400;700;900&family=Cinzel:wght@400;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
+  <!-- Stílusok -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="app">
+
+  <!-- ═══ FEJLÉC ═══ -->
+  <header>
+    <div class="title-rune">⚔ Látók Párbaja ⚔</div>
+    <div class="title-sub">Oracle Helper System v1.0</div>
+    <div class="shortcut-hint" style="margin-top:8px;">
+      <kbd>ESC</kbd> Teljes reset &nbsp;|&nbsp; <kbd>⌫</kbd> Visszavonás
+    </div>
+  </header>
+
+  <!-- ═══ STÁTUSZ CHIPEK ═══ -->
+  <div class="status-row" style="margin-bottom:16px;" id="statusRow">
+    <span class="status-chip chip-none" id="chip-mine">Lapom: —</span>
+    <span class="status-chip chip-none" id="chip-enemy">Ellenfél: —</span>
+    <span class="status-chip chip-none" id="chip-result">Eredmény: —</span>
+  </div>
+
+  <!-- ═══ FŐ RÁCS ═══ -->
+  <div class="main-grid">
+
+    <!-- Saját lapok panel -->
+    <div class="panel">
+      <div class="panel-title">Saját lapjaim</div>
+      <div class="cards-row" id="myCardsRow">
+        <!-- JavaScript tölti fel -->
+      </div>
+    </div>
+
+    <!-- Ellenfél lehetséges lapjai panel -->
+    <div class="panel enemy-panel">
+      <div class="panel-title">Ellenfél lehetséges lapjai</div>
+      <div class="enemy-cards-row" id="enemyCardsRow">
+        <!-- JavaScript tölti fel -->
+      </div>
+      <div class="divider" style="margin-top:14px;"></div>
+      <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);text-align:center;"
+           id="enemyCount">
+        Lehetséges: 9 / 9
+      </div>
+    </div>
+
+    <!-- Oracle javaslat panel -->
+    <div class="oracle-panel" style="grid-column: 1 / -1;">
+      <div class="oracle-header">
+        <div class="oracle-icon">🔮</div>
+        <div class="oracle-title">Oracle Javaslat</div>
+      </div>
+      <div class="oracle-body" id="oracleBody">
+        <!-- JavaScript tölti fel -->
+      </div>
+    </div>
+
+    <!-- ═══ AKCIÓ TERÜLET ═══ -->
+    <div class="action-area">
+
+      <!-- 1. lépés: Ellenfél lépése -->
+      <div class="panel" style="padding:16px;">
+        <div class="step-title">① Ellenfél lépése</div>
+        <div class="btn-group">
+          <button class="action-btn btn-even" id="btnEven"
+                  onclick="selectEnemyType('even')">
+            ⬛ Páros (Fekete)
+          </button>
+          <button class="action-btn btn-odd" id="btnOdd"
+                  onclick="selectEnemyType('odd')">
+            ⬜ Páratlan (Fehér)
+          </button>
+        </div>
+      </div>
+
+      <!-- 2. lépés: Kör eredménye -->
+      <div class="panel" style="padding:16px;">
+        <div class="step-title">② Kör eredménye</div>
+        <div class="btn-group">
+          <button class="action-btn btn-win" id="btnWin"
+                  onclick="selectResult('win')">
+            ✦ Nyertem
+          </button>
+          <button class="action-btn btn-lose" id="btnLose"
+                  onclick="selectResult('lose')">
+            ✧ Vesztettem
+          </button>
+          <button class="action-btn btn-draw" id="btnDraw"
+                  onclick="selectResult('draw')">
+            ◈ Döntetlen
+          </button>
+        </div>
+      </div>
+
+      <!-- 3. lépés: Megerősítés -->
+      <div class="panel" style="padding:16px;display:flex;flex-direction:column;justify-content:center;gap:10px;">
+        <div class="step-title">③ Megerősítés</div>
+        <button class="action-btn btn-confirm" id="btnConfirm"
+                onclick="confirmRound()" disabled>
+          ⟳ Kör lezárása
+        </button>
+        <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);text-align:center;line-height:1.6;"
+             id="confirmHint">
+          Válassz lapot, majd add meg<br>az ellenfél lépését és az eredményt
+        </div>
+      </div>
+
+    </div><!-- /action-area -->
+
+    <!-- ═══ KÖR NAPLÓ ═══ -->
+    <div class="history-panel" style="grid-column: 1 / -1;">
+      <div class="panel-title">Kör Napló</div>
+      <div class="history-list" id="historyList">
+        <div class="history-empty">Még nincs lejátszott kör.</div>
+      </div>
+    </div>
+
+  </div><!-- /main-grid -->
+</div><!-- /app -->
+
+<!-- JavaScript -->
+<script src="app.js"></script>
+
+</body>
+</html>
