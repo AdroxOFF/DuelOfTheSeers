@@ -1,6 +1,6 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — AUTOMATA PONTMAXIMALIZÁLÓ
-//  app.js (v4.1 - Végleges Vak/Látó Logika)
+//  app.js (v4.2 - Végleges Vak/Látó Logika + Okos Hibakezelés)
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -344,7 +344,7 @@ function renderOracle() {
 }
 
 // =============================================
-//  SELECTION HANDLERS
+//  SELECTION HANDLERS & OKOS HIBAKEZELÉS
 // =============================================
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
@@ -399,7 +399,53 @@ function updateChips() {
   }
 }
 
+// =============================================
+//  OKOS HIBAKEZELÉS (PREDIKTÍV GOMB TILTÁS)
+// =============================================
+function checkPossibleResults() {
+  const btnWin = document.getElementById('btnWin');
+  const btnLose = document.getElementById('btnLose');
+  const btnDraw = document.getElementById('btnDraw');
+
+  // 1. Alapállapot: minden gomb aktív
+  btnWin.disabled = false;
+  btnLose.disabled = false;
+  btnDraw.disabled = false;
+
+  // 2. Ha még nem tudjuk a mi lapunkat VAGY az ellenfél színét, kilépünk
+  if (selectedMine === null || selectedEnemy === null) return;
+
+  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+  let canWin = false, canLose = false, canDraw = false;
+
+  // 3. Végignézzük, mi történhet egyáltalán
+  for (let hand of possibleEnemyHands) {
+    let candidates = hand.filter(parityOk);
+    if (candidates.some(c => c < selectedMine)) canWin = true;
+    if (candidates.some(c => c > selectedMine)) canLose = true;
+    if (candidates.some(c => c === selectedMine)) canDraw = true;
+  }
+
+  // 4. Letiltjuk azt a gombot, aminek az esélye 0%
+  if (!canWin) btnWin.disabled = true;
+  if (!canLose) btnLose.disabled = true;
+  if (!canDraw) btnDraw.disabled = true;
+
+  // 5. Ha a felhasználó egy olyan eredményt jelölt be korábban, ami most lehetetlenné vált, nullázzuk
+  if ((!canWin && selectedResult === 'win') || 
+      (!canLose && selectedResult === 'lose') || 
+      (!canDraw && selectedResult === 'draw')) {
+      
+      selectedResult = null;
+      btnWin.classList.remove('active');
+      btnLose.classList.remove('active');
+      btnDraw.classList.remove('active');
+      updateChips();
+  }
+}
+
 function updateConfirmBtn() {
+  checkPossibleResults(); // Hibakezelés hívása a gomb aktiválása előtt
   const canConfirm = selectedMine !== null && selectedEnemy !== null && selectedResult !== null;
   document.getElementById('btnConfirm').disabled = !canConfirm;
 }
@@ -424,14 +470,8 @@ function deduceEnemyHands(myCard, enemyType, result) {
     }
   }
 
-  let newHands = [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
-
-  if (newHands.length === 0) {
-    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján!");
-    return possibleEnemyHands; 
-  }
-
-  return newHands;
+  // Tiszta visszaadás, nincs alert!
+  return [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
 }
 
 // =============================================
@@ -440,6 +480,24 @@ function deduceEnemyHands(myCard, enemyType, result) {
 function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
 
+  // 1. VÉDŐVONAL: Teszteljük a rögzítést MIELŐTT bármit módosítanánk!
+  let nextEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
+
+  // Ha a teszt elbukik (0 megmaradó kéz), azonnal megszakítjuk a függvényt!
+  if (nextEnemyHands.length === 0) {
+    alert("⚠️ HIBA: Ez az eredmény matematikailag lehetetlen az eddigi lapok alapján!\nKérlek, ellenőrizd az adatokat.");
+    
+    selectedResult = null;
+    document.getElementById('btnWin').classList.remove('active');
+    document.getElementById('btnLose').classList.remove('active');
+    document.getElementById('btnDraw').classList.remove('active');
+    updateChips();
+    updateConfirmBtn();
+    
+    return; // Emiatt NEM rontja el a historyt és NEM vonja le a kártyát
+  }
+
+  // 2. Ha átment a teszten, jöhet a tényleges mentés
   history.push({
     myCards: [...myCards],
     possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
@@ -455,7 +513,7 @@ function confirmRound() {
   if (selectedResult === 'win') myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
-  possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
+  possibleEnemyHands = nextEnemyHands; // Itt kapja meg a szűrt, jó adatot
   myCards = myCards.filter(c => c !== selectedMine);
 
   const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
