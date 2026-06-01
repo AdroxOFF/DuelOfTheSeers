@@ -390,4 +390,162 @@ function updateChips() {
 
   if (selectedResult) {
     const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
-    const cls    = { win: 'chip-result-win', lose: 'chip-result-lose
+    const cls    = { win: 'chip-result-win', lose: 'chip-result-lose', draw: 'chip-result-draw' };
+    cr.textContent = `Eredmény: ${labels[selectedResult]}`;
+    cr.className   = `status-chip ${cls[selectedResult]}`;
+  } else {
+    cr.textContent = 'Eredmény: —';
+    cr.className   = 'status-chip chip-none';
+  }
+}
+
+function updateConfirmBtn() {
+  const canConfirm = selectedMine !== null && selectedEnemy !== null && selectedResult !== null;
+  document.getElementById('btnConfirm').disabled = !canConfirm;
+}
+
+// =============================================
+//  DEDUCTION LOGIC
+// =============================================
+function deduceEnemyHands(myCard, enemyType, result) {
+  let newHandsSet = new Set();
+  const parityOk = enemyType === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+
+  for (let hand of possibleEnemyHands) {
+    let candidates = hand.filter(c => parityOk(c));
+    
+    if (result === 'win') candidates = candidates.filter(c => c < myCard);
+    else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
+    else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
+
+    for (let c of candidates) {
+      let newHand = hand.filter(card => card !== c);
+      newHandsSet.add(newHand.join(','));
+    }
+  }
+
+  let newHands = [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
+
+  if (newHands.length === 0) {
+    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján!");
+    return possibleEnemyHands; 
+  }
+
+  return newHands;
+}
+
+// =============================================
+//  CONFIRM ROUND
+// =============================================
+function confirmRound() {
+  if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
+
+  history.push({
+    myCards: [...myCards],
+    possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
+    myScore,
+    enemyScore,
+    selectedMine,
+    selectedEnemy,
+    selectedResult,
+    iStarted,
+    roundNum
+  });
+
+  if (selectedResult === 'win') myScore++;
+  else if (selectedResult === 'lose') enemyScore++;
+
+  possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
+  myCards = myCards.filter(c => c !== selectedMine);
+
+  const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+  const enemyLabel = (selectedEnemy === 'even' ? 'Páros' : 'Páratlan') + (iStarted ? ' (Én kezdtem)' : '');
+  const resultClass = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[selectedResult];
+
+  roundNum++;
+  addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
+
+  selectedMine   = null;
+  selectedEnemy  = null;
+  selectedResult = null;
+
+  clearActionButtons();
+  
+  autoSelectOracleCard(); 
+  
+  updateScoreBoard();
+  renderMyCards();
+  renderEnemyCards();
+  renderOracle();
+  updateConfirmBtn();
+  updateChips();
+}
+
+// =============================================
+//  HISTORY & UNDO
+// =============================================
+function addHistoryEntry(round, mine, enemy, result, cls) {
+  const list = document.getElementById('historyList');
+  if (list.querySelector('.history-empty')) list.innerHTML = '';
+
+  const entry = document.createElement('div');
+  entry.className = 'history-entry';
+  entry.innerHTML = `<span class="h-round">#${round}</span> <span class="h-mine">Én: ${mine}</span> <span class="h-enemy">Ell: ${enemy}</span> <span class="${cls}">${result}</span>`;
+  list.appendChild(entry);
+}
+
+function renderHistory() {
+  const list = document.getElementById('historyList');
+  list.innerHTML = '';
+  if (history.length === 0) {
+    list.innerHTML = '<div class="history-empty">Még nincs lejátszott kör.</div>';
+    return;
+  }
+  history.forEach((h, i) => {
+    const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+    const cls = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[h.selectedResult];
+    const enemyLabel = (h.selectedEnemy === 'even' ? 'Páros' : 'Páratlan') + (h.iStarted ? ' (Én kezdtem)' : '');
+    addHistoryEntry(i + 1, h.selectedMine, enemyLabel, labels[h.selectedResult], cls);
+  });
+}
+
+function undoLast() {
+  if (history.length === 0) return;
+  const snap = history.pop();
+  myCards = snap.myCards;
+  possibleEnemyHands = snap.possibleEnemyHands;
+  myScore = snap.myScore;
+  enemyScore = snap.enemyScore;
+  roundNum = snap.roundNum;
+
+  selectedMine = null; selectedEnemy = null; selectedResult = null;
+  clearActionButtons(); 
+  
+  autoSelectOracleCard();
+  
+  updateScoreBoard(); renderHistory(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips();
+}
+
+function resetAll() {
+  myCards = [...ALL_CARDS]; possibleEnemyHands = [ [...ALL_CARDS] ]; history = []; roundNum = 0;
+  myScore = 0; enemyScore = 0;
+  selectedMine = null; selectedEnemy = null; selectedResult = null;
+
+  const chk = document.getElementById('chkIStart'); if (chk) chk.checked = false; iStarted = false;
+  clearActionButtons(); 
+  
+  autoSelectOracleCard();
+  
+  updateScoreBoard(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips(); renderHistory();
+}
+
+function clearActionButtons() {
+  ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id => document.getElementById(id).classList.remove('active'));
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') { e.preventDefault(); resetAll(); }
+  else if (e.key === 'Backspace' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); undoLast(); }
+});
+
+init();
