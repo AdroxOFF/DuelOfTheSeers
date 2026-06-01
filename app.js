@@ -1,6 +1,6 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — ORACLE HELPER
-//  app.js  (v1.1 — kétsoroslapok + én-kezdem logika)
+//  app.js  (v1.2 — Utólagos naplózásra optimalizálva)
 // =============================================
 
 // =============================================
@@ -8,8 +8,6 @@
 // =============================================
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-// Páros (fekete): 0, 2, 4, 6, 8  →  alsó sor
-// Páratlan (fehér): 1, 3, 5, 7   →  felső sor
 const ODD_CARDS  = [1, 3, 5, 7];
 const EVEN_CARDS = [0, 2, 4, 6, 8];
 
@@ -33,8 +31,7 @@ function init() {
   if (chk) {
     chk.addEventListener('change', () => {
       iStarted = chk.checked;
-      updateEnemyTypeButtons();
-      updateConfirmBtn();
+      updateChips();
     });
   }
 
@@ -46,17 +43,15 @@ function init() {
 }
 
 // =============================================
-//  RENDER MY CARDS — kétsorosrács (páratlan fent, páros lent)
+//  RENDER MY CARDS — kétsorosrács
 // =============================================
 function renderMyCards() {
   const container = document.getElementById('myCardsRow');
   container.innerHTML = '';
 
-  // Felső sor — páratlan (fehér) lapok
   const oddRow = document.createElement('div');
   oddRow.className = 'cards-sub-row';
 
-  // Alsó sor — páros (fekete) lapok
   const evenRow = document.createElement('div');
   evenRow.className = 'cards-sub-row';
 
@@ -81,7 +76,6 @@ function renderMyCards() {
     numSpan.textContent = n;
     btn.appendChild(numSpan);
 
-    // Nyerési esély jelvény
     const badge = document.createElement('div');
     badge.className = 'badge';
     const pct = calcWinChance(n);
@@ -112,13 +106,12 @@ function renderMyCards() {
 }
 
 // =============================================
-//  RENDER ENEMY CARDS — kétsorosrács (páratlan fent, páros lent)
+//  RENDER ENEMY CARDS — kétsorosrács
 // =============================================
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
   container.innerHTML = '';
 
-  // Sor-feliratok
   const oddLabel  = document.createElement('div');
   oddLabel.className = 'cards-row-label';
   oddLabel.textContent = '⬜ Páratlan';
@@ -280,7 +273,7 @@ function selectMyCard(n) {
 }
 
 function selectEnemyType(type) {
-  if (iStarted) return; // Ha én kezdem, a gomb inaktív — ne csináljon semmit
+  // Nincs letiltás, utólag mindig tudjuk a paritást!
   selectedEnemy = (selectedEnemy === type) ? null : type;
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
@@ -295,30 +288,6 @@ function selectResult(res) {
   document.getElementById('btnDraw').classList.toggle('active', selectedResult === 'draw');
   updateChips();
   updateConfirmBtn();
-}
-
-// =============================================
-//  "ÉN KEZDEM" ÁLLAPOT — gombok inaktivitásának frissítése
-// =============================================
-function updateEnemyTypeButtons() {
-  const btnEven = document.getElementById('btnEven');
-  const btnOdd  = document.getElementById('btnOdd');
-
-  if (iStarted) {
-    // Letiltjuk és alaphelyzetbe hozzuk a paritásgombokat
-    btnEven.disabled = true;
-    btnOdd.disabled  = true;
-    btnEven.classList.remove('active');
-    btnOdd.classList.remove('active');
-    selectedEnemy = null;
-    // Chip frissítés
-    const ce = document.getElementById('chip-enemy');
-    ce.textContent = 'Ellenfél: ?';
-    ce.className   = 'status-chip chip-none';
-  } else {
-    btnEven.disabled = false;
-    btnOdd.disabled  = false;
-  }
 }
 
 // =============================================
@@ -337,10 +306,7 @@ function updateChips() {
     cm.className   = 'status-chip chip-none';
   }
 
-  if (iStarted) {
-    ce.textContent = 'Ellenfél: (én kezdtem)';
-    ce.className   = 'status-chip chip-none';
-  } else if (selectedEnemy) {
+  if (selectedEnemy) {
     ce.textContent = selectedEnemy === 'even' ? 'Ellenfél: Páros' : 'Ellenfél: Páratlan';
     ce.className   = 'status-chip chip-enemy';
   } else {
@@ -363,16 +329,15 @@ function updateChips() {
 //  CONFIRM BUTTON STATE
 // =============================================
 function updateConfirmBtn() {
-  // Ha én kezdtem: nem kell ellenfél-paritás
-  const enemyOk  = iStarted ? true : selectedEnemy !== null;
-  const canConfirm = selectedMine !== null && enemyOk && selectedResult !== null;
+  // Mostantól minden adat kötelező!
+  const canConfirm = selectedMine !== null && selectedEnemy !== null && selectedResult !== null;
   document.getElementById('btnConfirm').disabled = !canConfirm;
 
   const hint = document.getElementById('confirmHint');
   if (!selectedMine) {
     hint.innerHTML = 'Kattints egy lapra a sajátjaim közül';
-  } else if (!iStarted && !selectedEnemy) {
-    hint.innerHTML = `Lap <strong style="color:var(--purple-light)">${selectedMine}</strong> kiválasztva — add meg az ellenfél paritását`;
+  } else if (!selectedEnemy) {
+    hint.innerHTML = `Lap <strong style="color:var(--purple-light)">${selectedMine}</strong> kiválasztva — add meg az ellenfél paritását!`;
   } else if (!selectedResult) {
     hint.innerHTML = 'Add meg a kör eredményét';
   } else {
@@ -381,83 +346,43 @@ function updateConfirmBtn() {
 }
 
 // =============================================
-//  DEDUCTION LOGIC — helyes 1v1 logika
-//
-//  Minden körben az ellenfél PONTOSAN 1 lapot játszik ki.
-//  Azt a lapot el kell venni az ellenfél paklijából.
-//  A dedukció meghatározza MELYIK lap lehetett az,
-//  majd eltávolítja a legvalószínűbbet (középső értéket).
-//
-//  Ha ÉN KEZDTEM (iStarted = true):
-//    Paritás ismeretlen → az összes lehetséges lap figyelembe véve
-//    WIN  → ellenfél lapja valami volt < saját lapom
-//    LOSE → ellenfél lapja valami volt > saját lapom
-//    DRAW → ellenfél lapja = saját lapom
-//
-//  Ha AZ ELLENFÉL KEZDETT (iStarted = false):
-//    Paritás ismert → csak adott paritású lapok jönnek szóba
-//    WIN  → páros/páratlan ÉS < saját lapom
-//    LOSE → páros/páratlan ÉS > saját lapom
-//    DRAW → páros/páratlan ÉS = saját lapom
-//
-//  Az ellenfél paklijából MINDIG PONTOSAN 1 LAP KERÜL ELTÁVOLÍTÁSRA.
-//  Ha több lehetséges jelölt van, a középső értékűt vesszük el
-//  (ez adja a legjobb valószínűségi becslést).
+//  DEDUCTION LOGIC — Végleges logikai szűrés
 // =============================================
 function deduceEnemyCards(myCard, enemyType, result) {
-  let candidates = [...enemyCards];
+  // 1. lépés: Mivel utólag naplózunk, mindig csak a bemondott színű (paritású) lapokat vizsgáljuk
+  const parityOk = enemyType === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+  let candidates = enemyCards.filter(parityOk);
 
-  // 1. Szűkítsük a jelölteket az ismert információ alapján
-  if (iStarted) {
-    // Paritás ismeretlen — csak az eredmény alapján szűrünk
-    if (result === 'win') {
-      candidates = candidates.filter(c => c < myCard);
-    } else if (result === 'lose') {
-      candidates = candidates.filter(c => c > myCard);
-    } else if (result === 'draw') {
-      candidates = candidates.filter(c => c === myCard);
-    }
-  } else {
-    // Paritás ismert — paritás + eredmény alapján szűrünk
-    const parityOk = enemyType === 'even'
-      ? (c => c % 2 === 0)
-      : (c => c % 2 !== 0);
-
-    if (result === 'win') {
-      candidates = candidates.filter(c => parityOk(c) && c < myCard);
-    } else if (result === 'lose') {
-      candidates = candidates.filter(c => parityOk(c) && c > myCard);
-    } else if (result === 'draw') {
-      candidates = candidates.filter(c => parityOk(c) && c === myCard);
-    }
+  // 2. lépés: Rászűrünk a kisebb/nagyobb/egyenlő szabályra
+  if (result === 'win') {
+    candidates = candidates.filter(c => c < myCard);
+  } else if (result === 'lose') {
+    candidates = candidates.filter(c => c > myCard);
+  } else if (result === 'draw') {
+    candidates = candidates.filter(c => c === myCard);
   }
 
-  // 2. Ha nincs jelölt (ellentmondásos adat), fallback: ne változtassunk semmit
+  // 3. Biztonsági háló: Ha ellentmondásos lenne valami a játékban, 
+  // akkor is kiveszünk egy olyan színű lapot, amilyet jelöltél.
   if (candidates.length === 0) {
-    return [...enemyCards];
+    candidates = enemyCards.filter(parityOk);
+    if (candidates.length === 0) return [...enemyCards]; // Legvégső eset, ha elfogyna a szín
   }
 
-  // 3. Válasszuk ki, melyik lapot vesszük el az ellenfél paklijából.
-  //    A középső értékű jelöltet választjuk — ez a legjobb becslés
-  //    ha nem tudjuk pontosan melyiket játszotta ki.
+  // 4. Eltávolítunk pontosan 1 lapot (a lehetőségek közül statisztikailag a középsőt)
   candidates.sort((a, b) => a - b);
   const midIndex  = Math.floor(candidates.length / 2);
   const removedCard = candidates[midIndex];
 
-  // 4. Eltávolítjuk pontosan ezt az 1 lapot az ellenfél paklijából
-  const newEnemy = enemyCards.filter(c => c !== removedCard);
-
-  return newEnemy;
+  return enemyCards.filter(c => c !== removedCard);
 }
 
 // =============================================
 //  CONFIRM ROUND
 // =============================================
 function confirmRound() {
-  const enemyOk = iStarted ? true : selectedEnemy !== null;
-  if (selectedMine === null || !enemyOk || !selectedResult) return;
+  if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
 
-  // Pillanatkép mentése visszavonáshoz
   history.push({
     myCards:       [...myCards],
     enemyCards:    [...enemyCards],
@@ -468,27 +393,21 @@ function confirmRound() {
     roundNum
   });
 
-  // Dedukció futtatása
   enemyCards = deduceEnemyCards(selectedMine, selectedEnemy, selectedResult);
-
-  // Kijátszott lap eltávolítása a kézből
   myCards = myCards.filter(c => c !== selectedMine);
 
-  // Napló bejegyzés
-  const labels     = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
-  const enemyLabel = iStarted
-    ? '(én kezdtem)'
-    : (selectedEnemy === 'even' ? 'Páros' : 'Páratlan');
+  const labels      = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+  
+  // A naplóban vizuálisan jelezzük, ha te kezdted
+  const enemyLabel  = (selectedEnemy === 'even' ? 'Páros' : 'Páratlan') + (iStarted ? ' (Én kezdtem)' : '');
   const resultClass = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[selectedResult];
 
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
 
-  // Kör-szelekciók törlése
   selectedMine   = null;
   selectedEnemy  = null;
   selectedResult = null;
-  // iStarted-t NEM töröljük — a checkbox állapota marad
 
   clearActionButtons();
   renderMyCards();
@@ -527,9 +446,7 @@ function renderHistory() {
   history.forEach((h, i) => {
     const labels     = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
     const cls        = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[h.selectedResult];
-    const enemyLabel = h.iStarted
-      ? '(én kezdtem)'
-      : (h.selectedEnemy === 'even' ? 'Páros' : 'Páratlan');
+    const enemyLabel = (h.selectedEnemy === 'even' ? 'Páros' : 'Páratlan') + (h.iStarted ? ' (Én kezdtem)' : '');
     addHistoryEntry(i + 1, h.selectedMine, enemyLabel, labels[h.selectedResult], cls);
   });
 }
@@ -548,7 +465,6 @@ function undoLast() {
   selectedMine   = null;
   selectedEnemy  = null;
   selectedResult = null;
-  // iStarted-t a checkbox aktuális állapota határozza meg — nem állítjuk vissza
 
   clearActionButtons();
   renderHistory();
@@ -572,11 +488,9 @@ function resetAll() {
   selectedEnemy  = null;
   selectedResult = null;
 
-  // Checkbox reset
   const chk = document.getElementById('chkIStart');
   if (chk) chk.checked = false;
   iStarted = false;
-  updateEnemyTypeButtons();
 
   clearActionButtons();
   renderMyCards();
@@ -594,8 +508,6 @@ function clearActionButtons() {
   ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id => {
     document.getElementById(id).classList.remove('active');
   });
-  // Paritásgombok engedélyezési állapota is frissüljön
-  updateEnemyTypeButtons();
 }
 
 // =============================================
