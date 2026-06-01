@@ -1,12 +1,12 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — ORACLE HELPER
-//  app.js  (v2.0 — "Multiverzum" Dedukciós Motor)
+//  app.js  (v2.0 — Multiverzum Logika + % Mutató)
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 let myCards = [...ALL_CARDS]; 
-// ÚJ: Ahelyett, hogy 1 paklit tárolnánk, tároljuk az ÖSSZES lehetséges pakli-kombinációt
+// Multiverzum állapot: Az összes lehetséges pakli kombinációjának tömbje
 let possibleEnemyHands = [ [...ALL_CARDS] ]; 
 
 let selectedMine   = null;   
@@ -36,8 +36,9 @@ function init() {
 }
 
 // =============================================
-//  ÚJ: SEGÉDFÜGGVÉNYEK A TÖBBES PAKLIHOZ
+//  SEGÉDFÜGGVÉNYEK A MULTIVERZUMHOZ
 // =============================================
+
 // Visszaadja az összes olyan lapot (egyedi listaként), ami BÁRMELYIK lehetséges pakliban benne van
 function getPossibleEnemyCards() {
   if (possibleEnemyHands.length === 0) return [];
@@ -56,6 +57,16 @@ function calcWinChance(myCard) {
   });
 
   return Math.round((totalWins / totalCardsToFace) * 100);
+}
+
+// Kiszámolja, hány százalék eséllyel van még bent egy adott lap az ellenfélnél
+function calcEnemyCardChance(card) {
+  if (possibleEnemyHands.length === 0) return 0;
+  let count = 0;
+  possibleEnemyHands.forEach(hand => {
+    if (hand.includes(card)) count++;
+  });
+  return Math.round((count / possibleEnemyHands.length) * 100);
 }
 
 // =============================================
@@ -119,7 +130,7 @@ function renderMyCards() {
 }
 
 // =============================================
-//  RENDER ENEMY CARDS 
+//  RENDER ENEMY CARDS — + Százalékos mutató
 // =============================================
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
@@ -144,6 +155,7 @@ function renderEnemyCards() {
   ALL_CARDS.forEach(n => {
     const isEven   = n % 2 === 0;
     const possible = currentPossibleCards.includes(n);
+    const chance   = calcEnemyCardChance(n);
 
     const slot = document.createElement('div');
     slot.className = [
@@ -152,7 +164,26 @@ function renderEnemyCards() {
       possible ? 'possible' : 'eliminated'
     ].join(' ');
 
-    slot.textContent = n;
+    const numSpan = document.createElement('span');
+    numSpan.textContent = n;
+    slot.appendChild(numSpan);
+
+    // Százalék kiírása, ha a lap még lehetséges
+    if (possible) {
+      const chanceDiv = document.createElement('div');
+      chanceDiv.className = 'enemy-chance';
+      
+      if (chance === 100) {
+        chanceDiv.classList.add('sure-chance');
+        chanceDiv.textContent = '100%';
+      } else {
+        if (chance >= 70) chanceDiv.classList.add('high-chance');
+        else if (chance <= 30) chanceDiv.classList.add('low-chance');
+        chanceDiv.textContent = chance + '%';
+      }
+      
+      slot.appendChild(chanceDiv);
+    }
 
     if (isEven) evenRow.appendChild(slot);
     else oddRow.appendChild(slot);
@@ -163,7 +194,6 @@ function renderEnemyCards() {
   container.appendChild(evenLabel);
   container.appendChild(evenRow);
 
-  // Mivel minden lehetséges pakli ugyanannyi lapból áll, elég az elsőt megnézni
   const cardsLeftInDeck = possibleEnemyHands.length > 0 ? possibleEnemyHands[0].length : 0;
   document.getElementById('enemyCount').textContent =
     `Pakli: ${cardsLeftInDeck} lap | Univerzumok: ${possibleEnemyHands.length}`;
@@ -179,7 +209,7 @@ function getBestCard() {
 
   myCards.forEach(c => {
     const pct = calcWinChance(c);
-    const infoScore = 100 - Math.abs(pct - 50); // 50% körüli lapok adnak legtöbb infót
+    const infoScore = 100 - Math.abs(pct - 50); // Információs érték: medián felé húz
     const score = pct * 10 + infoScore; 
     if (score > bestScore) {
       bestScore = score;
@@ -245,7 +275,7 @@ function renderOracle() {
       <div class="oracle-main-text">${reasonText}</div>
       <div class="oracle-sub-text">
         Kombinációk: ${possibleEnemyHands.length} db &nbsp;|&nbsp;
-        Fent maradt gyanúsítottak: ${currentPossibleCards.join(', ')} &nbsp;|&nbsp;
+        Gyanúsítottak: ${currentPossibleCards.join(', ')} &nbsp;|&nbsp;
         Saját kezem: ${myCards.join(', ')}
       </div>
     </div>
@@ -345,37 +375,30 @@ function updateConfirmBtn() {
 }
 
 // =============================================
-//  ÚJ DEDUCTION LOGIC — A Multiverzum Létrehozása
+//  DEDUCTION LOGIC — A Multiverzum Létrehozása
 // =============================================
 function deduceEnemyHands(myCard, enemyType, result) {
   let newHandsSet = new Set();
   const parityOk = enemyType === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
 
-  // Végigmegyünk minden eddig lehetséges univerzumon (paklin)
   for (let hand of possibleEnemyHands) {
-    
-    // Mik lehettek az ellenfél kijátszott lapjai ebben a konkrét pakliban?
     let candidates = hand.filter(c => parityOk(c));
     
     if (result === 'win') candidates = candidates.filter(c => c < myCard);
     else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
     else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
 
-    // Minden egyes lehetséges kijátszott laphoz létrehozunk egy új jövőbeli univerzumot
     for (let c of candidates) {
       let newHand = hand.filter(card => card !== c);
-      // Stringként mentjük a Set-be, hogy automatikusan kiszűrjük a duplikációkat
       newHandsSet.add(newHand.join(','));
     }
   }
 
-  // Stringek visszaalakítása szám-tömbökké
   let newHands = [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
 
-  // Biztonsági háló: ha lehetetlent kattintott a felhasználó
   if (newHands.length === 0) {
     alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Kérlek ellenőrizd, mit kattintottál.");
-    return possibleEnemyHands; // Nem rontjuk el az eddigi jó adatokat
+    return possibleEnemyHands; 
   }
 
   return newHands;
@@ -387,7 +410,6 @@ function deduceEnemyHands(myCard, enemyType, result) {
 function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
 
-  // Deep copy az univerzumnak a visszavonáshoz
   history.push({
     myCards: [...myCards],
     possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
@@ -398,10 +420,7 @@ function confirmRound() {
     roundNum
   });
 
-  // Multiverzum frissítése
   possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
-  
-  // Saját lap eldobása
   myCards = myCards.filter(c => c !== selectedMine);
 
   const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
