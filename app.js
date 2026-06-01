@@ -1,6 +1,6 @@
 // =============================================
-//  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ AI
-//  app.js (v3.0)
+//  LÁTÓK PÁRBAJA — AUTOMATA PONTMAXIMALIZÁLÓ
+//  app.js (v4.0)
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -24,9 +24,25 @@ function init() {
   if (chk) {
     chk.addEventListener('change', () => {
       iStarted = chk.checked;
+      
+      // Ha mi kezdünk, lenullázzuk az ellenfél tippjét, és AUTOMATIKUSAN vak ajánlást kérünk
+      if (iStarted) {
+        selectedEnemy = null;
+        document.getElementById('btnEven').classList.remove('active');
+        document.getElementById('btnOdd').classList.remove('active');
+      }
+      
+      autoSelectOracleCard(); // <-- AZ ÚJ AUTOMATA KIJELÖLŐ
+      
       updateChips();
+      updateConfirmBtn();
+      renderMyCards();
+      renderEnemyCards();
+      renderOracle();
     });
   }
+  
+  autoSelectOracleCard();
   updateScoreBoard();
   renderMyCards();
   renderEnemyCards();
@@ -36,13 +52,26 @@ function init() {
 }
 
 // =============================================
+//  AUTOMATA KÁRTYA KIJELÖLŐ LOGIKA
+// =============================================
+function autoSelectOracleCard() {
+  // Csak akkor jelöl ki automatikusan, ha:
+  // 1. Én kezdek (vakon kell dönteni)
+  // 2. VAGY az ellenfél kezd, DE már megadtuk, hogy milyen színt tett.
+  if (iStarted || selectedEnemy !== null) {
+      selectedMine = getBestCard();
+  } else {
+      selectedMine = null; // Várunk az ellenfél lépésére
+  }
+}
+
+// =============================================
 //  DINAMIKUS VALÓSZÍNŰSÉG SZÁMÍTÓ MOTOR
 // =============================================
 function getActiveEnemyCardProbabilities() {
   let cardCounts = {};
   let total = 0;
   
-  // Ha ki van választva a paritás, azonnal csak azokra szűrünk!
   const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0) :
                    selectedEnemy === 'odd'  ? (c => c % 2 !== 0) :
                    (c => true);
@@ -129,11 +158,8 @@ function renderMyCards() {
   const container = document.getElementById('myCardsRow');
   container.innerHTML = '';
 
-  const oddRow = document.createElement('div');
-  oddRow.className = 'cards-sub-row';
-
-  const evenRow = document.createElement('div');
-  evenRow.className = 'cards-sub-row';
+  const oddRow = document.createElement('div'); oddRow.className = 'cards-sub-row';
+  const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
   ALL_CARDS.forEach(n => {
     const isEven = n % 2 === 0;
@@ -152,7 +178,6 @@ function renderMyCards() {
     const badge = document.createElement('div');
     badge.className = 'badge';
     
-    // A kiválasztott paritás alapján élőben számoljuk a %-ot!
     const stats = calcRoundStats(n);
     const pct = stats.win;
 
@@ -166,7 +191,9 @@ function renderMyCards() {
     }
     btn.appendChild(badge);
 
+    // Kézi felülbírálás lehetősége
     if (inHand) btn.onclick = () => selectMyCard(n);
+    
     if (isEven) evenRow.appendChild(btn);
     else oddRow.appendChild(btn);
   });
@@ -217,37 +244,37 @@ function renderEnemyCards() {
 }
 
 // =============================================
-//  ORACLE AI - PONTMAXIMALIZÁLÓ HEURISZTIKA
+//  ORACLE AI - AGRESSZÍV PONTMAXIMALIZÁLÓ
 // =============================================
 function getBestCard() {
   if (myCards.length === 0) return null;
-  let best = null;
-  let bestStrategyScore = -Infinity;
+  
+  let stats = myCards.map(c => ({ card: c, s: calcRoundStats(c) }));
+  
+  // 1. Biztos Pontszerzők (Nyerési esély >= 60%)
+  let solidWinners = stats.filter(item => item.s.win >= 60);
+  if (solidWinners.length > 0) {
+      solidWinners.sort((a, b) => a.card - b.card);
+      return solidWinners[0].card;
+  }
 
-  myCards.forEach(c => {
-     let s = calcRoundStats(c);
-     let score = 0;
+  // 2. Kockázatos, de esélyes (Nyerési esély >= 40%)
+  let possibleWinners = stats.filter(item => item.s.win >= 40);
+  if (possibleWinners.length > 0) {
+      possibleWinners.sort((a, b) => a.card - b.card);
+      return possibleWinners[0].card;
+  }
 
-     if (s.win >= 70) {
-       // Biztos győzelem. A LEGKISEBB ilyen kártyát javasoljuk, hogy spóroljunk a nagyokkal!
-       score = 10000 - c * 10 + s.win;
-     } else if (s.win >= 40) {
-       // Megküzdött kör.
-       score = 5000 + s.win * 10 - c;
-     } else if (s.draw >= 50) {
-       // Döntetlen kimentése.
-       score = 3000 + s.draw * 10 - c;
-     } else {
-       // Elvesztett kör. Szabaduljunk meg a LEGKISEBB lapunktól.
-       score = 1000 - c * 10;
-     }
+  // 3. Döntetlen kimentése
+  let drawSavers = stats.filter(item => item.s.draw >= 50);
+  if (drawSavers.length > 0) {
+      drawSavers.sort((a, b) => a.card - b.card);
+      return drawSavers[0].card;
+  }
 
-     if (score > bestStrategyScore) {
-       bestStrategyScore = score;
-       best = c;
-     }
-  });
-  return best;
+  // 4. Taktikai Áldozat (Legkisebb lap)
+  let sortedByValue = [...myCards].sort((a, b) => a - b);
+  return sortedByValue[0];
 }
 
 function renderOracle() {
@@ -258,37 +285,24 @@ function renderOracle() {
     return;
   }
 
-  const isFirstMove = roundNum === 0 && selectedMine === null;
-
-  let suggestedCard;
-  if (isFirstMove && !selectedEnemy) {
-    suggestedCard = myCards.includes(4) ? 4 : (myCards.includes(5) ? 5 : getBestCard());
-  } else {
-    suggestedCard = getBestCard();
-  }
-
+  let suggestedCard = getBestCard();
   if (suggestedCard === null) return;
 
   const isEven = suggestedCard % 2 === 0;
   const s = calcRoundStats(suggestedCard);
   
   let strategyDesc = "";
-  if (isFirstMove && !selectedEnemy) {
-     strategyDesc = `Nyitólap a <strong>${suggestedCard}</strong>-es — információszerzés céljából a legjobb. (Utána térünk át a pontmaximalizálásra!)`;
+  if (s.win >= 60) {
+     strategyDesc = `🔥 <strong>TÁMADÁS:</strong> A <strong>${suggestedCard}</strong>-es a legkisebb lapod, amivel már nagyon magas (<strong>${s.win}%</strong>) eséllyel pontot szerzel. A nagyobb lapjaidat megspórolod későbbre!`;
+  } else if (s.win >= 40) {
+     strategyDesc = `⚖️ <strong>KIEGYENLÍTETT:</strong> A <strong>${suggestedCard}</strong>-es lap a legjobb kompromisszum. Van esély a pontra (<strong>${s.win}%</strong>), de nem fáj annyira, ha mégis elbukjuk.`;
+  } else if (s.draw >= 50) {
+     strategyDesc = `🛡️ <strong>VÉDEKEZÉS:</strong> A <strong>${suggestedCard}</strong>-es lappal jó eséllyel (<strong>${s.draw}%</strong>) kimentünk egy döntetlent.`;
   } else {
-     if (s.win >= 70) {
-       strategyDesc = `A <strong>${suggestedCard}</strong>-es a legkisebb lapod, amivel szinte biztosan (<strong>${s.win}%</strong>) pontot rabolhatsz.`;
-     } else if (s.win >= 40) {
-       strategyDesc = `A <strong>${suggestedCard}</strong>-es lap a legjobb kompromisszum a pontszerzésre (<strong>${s.win}%</strong> nyerési esély).`;
-     } else if (s.draw >= 50) {
-       strategyDesc = `Valószínűleg hátrányban vagyunk. A <strong>${suggestedCard}</strong>-es lappal nagy eséllyel (<strong>${s.draw}%</strong>) kimenthetünk egy döntetlent!`;
-     } else {
-       strategyDesc = `Az ellenfélnek valószínűleg erős lapja van. Dobd be a <strong>${suggestedCard}</strong>-est (legkisebb lapod), hogy minimalizáld a veszteséget!`;
-     }
+     strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Nincs jó nyerő lapod. Dobd be a <strong>${suggestedCard}</strong>-est (a legkisebbet), hogy az ellenfél elpazarolja az egyik nagy lapját!`;
   }
 
   const winColor = s.win >= 60 ? 'stat-val-green' : s.win >= 40 ? 'stat-val-gold' : 'stat-val-red';
-
   const cardStats = myCards.map(c => ({ card: c, s: calcRoundStats(c) })).sort((a, b) => b.s.win - a.s.win).slice(0, 4);
 
   body.innerHTML = `
@@ -298,7 +312,7 @@ function renderOracle() {
       </div>
     </div>
     <div class="oracle-text">
-      <div class="oracle-main-text">${strategyDesc}</div>
+      <div class="oracle-main-text" style="font-size: 11.5px;">${strategyDesc}</div>
     </div>
     <div class="oracle-stats">
       <div class="oracle-stat-row">
@@ -329,7 +343,7 @@ function renderOracle() {
 // =============================================
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
-  selectedMine = (selectedMine === n) ? null : n;
+  selectedMine = (selectedMine === n) ? null : n; // Kézi felülbírálás engedélyezése
   renderMyCards();
   updateChips();
   updateConfirmBtn();
@@ -339,10 +353,11 @@ function selectEnemyType(type) {
   selectedEnemy = (selectedEnemy === type) ? null : type;
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
+  
+  autoSelectOracleCard(); // <-- AZ ÚJ AUTOMATA KIJELÖLŐ
+  
   updateChips();
   updateConfirmBtn();
-  
-  // ÉLŐ FRISSÍTÉS! Amint rákattintasz a paritásra, minden újra kalkulálódik!
   renderMyCards();
   renderEnemyCards();
   renderOracle();
@@ -407,7 +422,7 @@ function deduceEnemyHands(myCard, enemyType, result) {
   let newHands = [...newHandsSet].map(str => str === "" ? [] : str.split(',').map(Number));
 
   if (newHands.length === 0) {
-    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Biztos jó adatot adtál meg?");
+    alert("Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján!");
     return possibleEnemyHands; 
   }
 
@@ -432,7 +447,6 @@ function confirmRound() {
     roundNum
   });
 
-  // Pontok számolása
   if (selectedResult === 'win') myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
@@ -451,6 +465,9 @@ function confirmRound() {
   selectedResult = null;
 
   clearActionButtons();
+  
+  autoSelectOracleCard(); // <-- AZ ÚJ AUTOMATA KIJELÖLŐ (Következő körhöz)
+  
   updateScoreBoard();
   renderMyCards();
   renderEnemyCards();
@@ -497,7 +514,11 @@ function undoLast() {
   roundNum = snap.roundNum;
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
-  clearActionButtons(); updateScoreBoard(); renderHistory(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips();
+  clearActionButtons(); 
+  
+  autoSelectOracleCard(); // Visszavonás után is automatikusan bejelöl!
+  
+  updateScoreBoard(); renderHistory(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips();
 }
 
 function resetAll() {
@@ -506,7 +527,11 @@ function resetAll() {
   selectedMine = null; selectedEnemy = null; selectedResult = null;
 
   const chk = document.getElementById('chkIStart'); if (chk) chk.checked = false; iStarted = false;
-  clearActionButtons(); updateScoreBoard(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips(); renderHistory();
+  clearActionButtons(); 
+  
+  autoSelectOracleCard();
+  
+  updateScoreBoard(); renderMyCards(); renderEnemyCards(); renderOracle(); updateConfirmBtn(); updateChips(); renderHistory();
 }
 
 function clearActionButtons() {
