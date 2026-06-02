@@ -611,12 +611,12 @@ function selectEnemyType(type) {
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
-  // Paritásváltáskor mindig újraszámoljuk az EV-t — az ellenfél lehetséges
-  // lapkészlete megváltozik a páros/páratlan szűrővel.
-  // Ha a user NEM választott manuálisan lapot, az ajánlást is frissítjük.
-  // (manuális választásnál megtartjuk a lapot, csak az EV értékek frissülnek)
+  // Paritásváltáskor mindig újraszámoljuk az EV-t.
+  // Ha MI KEZDTÜK a kört: a lapot vakon választottuk ELŐRE → paritás utólagos info,
+  //   ne bántsuk a kijelölt lapot (se manuálisnál, se autoselectnél).
+  // Ha ELLENFÉL KEZDTE: a paritás előzetes info → ha nem manuális, az oracle frissít.
   _invalidateEVCache();
-  if (!_cardManuallySelected) {
+  if (!iStarted && !_cardManuallySelected) {
     autoSelectOracleCard();
   }
 
