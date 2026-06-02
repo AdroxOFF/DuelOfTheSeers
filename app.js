@@ -1,16 +1,21 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v6.0 — Javított EV motor + hibakezelés
+//  app.js v7.0
 // =============================================
 //
-//  JAVÍTÁSOK v5.0 → v6.0:
-//  [BUG1] EV cache kulcs integer overflow javítva → Map-kulcs string lett
-//  [BUG2] enemyUnionAll → weighted sample helyett kerül alkalmazásra
-//  [BUG3] Döntetlen dedukció: páros/páratlan inkonzisztencia kezelve
-//  [BUG4] confirmRound() után selectedEnemy reset iStarted alapján
-//  [BUG5] Dupla-kattintás védelem confirmRound()-on
-//  [UX1]  Gombok vizuális disabled state + inline hibaüzenetek
-//  [UX2]  Dedukció hiba modal helyett inline visszajelzés
+//  JAVÍTÁSOK v6.0 → v7.0:
+//  [PERF1] _evCache.clear() áthelyezve confirmRound()-ba — nem minden getAllCardEVs()-be
+//  [PERF2] getAllCardEVs() eredménye cachelve körön belül (_lastEVList),
+//          renderMyCards + renderOracle + autoSelect mind ebből olvas
+//  [PERF3] _validateResult() eredménye cachelve (_lastValidation), nem számolja újra
+//  [BUG6]  ecToHands súlyozás javítva: (handEVSum/len)*len = handEVSum volt, weight elveszett
+//  [BUG7]  selectMyCard() frissíti az eredmény-gombok tiltott állapotát is
+//  [UX2]   Eredmény-gombok (Win/Lose/Draw) csak akkor kattinthatók ha az adott
+//          eredmény lehetséges a jelenlegi saját lap + ellenfél paritás alapján
+//          — hibaüzenet helyett a gomb el van szürkítve
+//  [UX3]   Páros/Páratlan gombok mindig engedélyezve — ha mi kezdünk, a paritást
+//          a kör UTÁN látjuk az ellenfél kezéből (melyik szín fogyott), ezért
+//          a rögzítés előtt bármikor megadható
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -22,25 +27,23 @@ let myScore    = 0;
 let enemyScore = 0;
 
 let selectedMine   = null;
-let selectedEnemy  = null;  // 'even' | 'odd' | null
-let selectedResult = null;  // 'win' | 'lose' | 'draw' | null
+let selectedEnemy  = null;
+let selectedResult = null;
 let iStarted       = false;
 
 let history  = [];
 let roundNum = 0;
-let isConfirming = false; // [BUG5] dupla-kattintás védelem
+let isConfirming = false;
 
 // =============================================
-//  EV MOTOR — JAVÍTOTT CACHE KULCS
-//  [BUG1] Régi: bitshift overflow 32 bites signed int-nél
-//         Új:   string kulcs → nincs overflow, nincs ütközés
+//  EV MOTOR
 // =============================================
 let _evCache = new Map();
+let _lastEVList = null;          // [PERF2] kör-szintű EV cache
+let _lastValidation = null;      // [PERF3] validáció cache
 
 function _maskCount(m) {
-  let n = 0;
-  while (m) { n += m & 1; m >>= 1; }
-  return n;
+  let n = 0; while (m) { n += m & 1; m >>= 1; } return n;
 }
 
 function _finalScore(myS, enemyS) {
@@ -48,22 +51,18 @@ function _finalScore(myS, enemyS) {
   return d > 0 ? myS + d : 0;
 }
 
-// [BUG1 FIX] String alapú cache kulcs — nincs bitshift overflow
 function _computeEV(myMask, enemyMask, myS, enemyS) {
   if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
 
-  // String kulcs: nincs integer overflow 9 bites maskoknál sem
   const key = `${myMask},${enemyMask},${myS},${enemyS}`;
   if (_evCache.has(key)) return _evCache.get(key);
 
   const eCnt = _maskCount(enemyMask);
   const losePrefer = myS < enemyS;
-
   let bestEV = -Infinity, bestCard = -1;
 
   for (let mc = 0; mc <= 8; mc++) {
     if (!(myMask & (1 << mc))) continue;
-
     const nextMy = myMask ^ (1 << mc);
     let total = 0;
 
@@ -81,7 +80,6 @@ function _computeEV(myMask, enemyMask, myS, enemyS) {
 
     const isBetter = total > bestEV ||
       (total === bestEV && (losePrefer ? mc > bestCard : mc < bestCard));
-
     if (isBetter) { bestEV = total; bestCard = mc; }
   }
 
@@ -90,14 +88,10 @@ function _computeEV(myMask, enemyMask, myS, enemyS) {
   return r;
 }
 
-// [BUG2 FIX] Weighted card distribution — paritás szűrővel
-// Az ellenfél jövőbeli lapjainak kezelése: MINDEN lehetséges kézre
-// külön-külön számítunk EV-t, nem union közelítéssel.
 function _getWeightedCards(parity) {
   const parityOk = parity === 'even' ? (c => c % 2 === 0)
                  : parity === 'odd'  ? (c => c % 2 !== 0)
                  : (c => true);
-
   let cardCounts = {}, total = 0;
   for (const hand of possibleEnemyHands) {
     for (const c of hand.filter(parityOk)) {
@@ -108,63 +102,55 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// [BUG2 FIX] getAllCardEVs: jövőbeli ellenfél-lapokat
-// per-hand számítjuk, nem union-ként.
-// Minden lehetséges (saját lap, ellenfél lap) párhoz:
-//   - az ellenfél keze a konkrét hand mínusz a lerakott lap
-//   - ezek súlyozva átlagolódnak
+// [PERF2] Kör-szintű EV cache: csak akkor számol újra, ha az input változott
+// [BUG6]  Súlyozás javítva: minden (ec, hand) párhoz 1 szavazat,
+//         az átlagolás a total (összes szavazat) alapján történik
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
-  _evCache.clear();
+
+  // [PERF2] Ha semmi nem változott, visszaadjuk a cached listát
+  if (_lastEVList) return _lastEVList;
 
   const { cardCounts, total } = _getWeightedCards(selectedEnemy);
   const losePrefer = myScore < enemyScore;
-
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  // Inverz index: melyik hand tartalmazza az adott ellenfél-lapot
-  // (paritás szűrő után) — és mi az a hand
-  // Struktúra: { ec: [ { handMask, weight } ] }
-  const ecToHands = {};
   const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0)
                  : selectedEnemy === 'odd'  ? (c => c % 2 !== 0)
                  : (c => true);
 
+  // [BUG6 FIX] ecToHands: minden (ec, hand) párt külön tárolunk
+  // Súly = 1 per (ec, hand) pár, az összes szavazat = total
+  const ecToHands = {};
   for (const hand of possibleEnemyHands) {
-    const validCards = hand.filter(parityOk);
-    for (const ec of validCards) {
+    for (const ec of hand.filter(parityOk)) {
       if (!ecToHands[ec]) ecToHands[ec] = [];
-      // A jövőbeli ellenfél-mask: a hand összes lapja MÍNUSZ a lerakott ec
       const futureMask = hand.reduce((m, c) => m | (1 << c), 0) ^ (1 << ec);
-      ecToHands[ec].push({ futureMask, weight: 1 });
+      ecToHands[ec].push(futureMask);
     }
   }
 
-  return myCards.map(myCard => {
+  _lastEVList = myCards.map(myCard => {
     const nextMyMask = nextMyBase ^ (1 << myCard);
     let totalEV = 0;
 
     if (total === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      for (const [ecStr, handList] of Object.entries(ecToHands)) {
+      // [BUG6 FIX] Minden (ec, futureMask) pár egyenlő súlyú (1/total)
+      for (const [ecStr, futureMasks] of Object.entries(ecToHands)) {
         const ec = parseInt(ecStr);
         let nm = myScore, ne = enemyScore;
         if (myCard > ec) nm++; else if (myCard < ec) ne++;
 
-        // Minden hand-re külön EV, majd átlag
-        let handEVSum = 0;
-        for (const { futureMask } of handList) {
+        for (const futureMask of futureMasks) {
           const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
-          handEVSum += subEV;
+          totalEV += subEV;
         }
-        // Súly: hány hand-ben szerepel ez az ec
-        totalEV += (handEVSum / handList.length) * handList.length;
       }
       totalEV /= total;
     }
 
-    // Aktuális kör statisztikák (win/lose/draw %)
     let w = 0, l = 0, d = 0;
     for (const [ecStr, weight] of Object.entries(cardCounts)) {
       const ec = parseInt(ecStr);
@@ -181,11 +167,66 @@ function getAllCardEVs() {
   }).sort((a, b) =>
     b.ev - a.ev || (losePrefer ? b.card - a.card : a.card - b.card)
   );
+
+  return _lastEVList;
+}
+
+// [PERF2] EV lista invalidálása: hívd minden állapotváltozáskor
+function _invalidateEVCache() {
+  _lastEVList = null;
+  _lastValidation = null;
 }
 
 function getBestCard() {
   const evs = getAllCardEVs();
   return evs.length > 0 ? evs[0].card : null;
+}
+
+// =============================================
+//  VALIDÁCIÓ — CACHELVE
+//  [PERF3] Csak akkor számol újra, ha input változott
+//  [UX2]   Visszaadja melyik eredmény-gombok engedélyezhetők
+// =============================================
+function _getResultAvailability() {
+  // Cache key: mi függ tőle
+  const key = `${selectedMine}|${selectedEnemy}`;
+  if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
+
+  const availability = { win: true, lose: true, draw: true };
+
+  if (selectedMine === null || selectedEnemy === null) {
+    // Ha nincs lap vagy paritás: minden tiltott
+    availability.win = false;
+    availability.lose = false;
+    availability.draw = false;
+    _lastValidation = { key, result: availability };
+    return availability;
+  }
+
+  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+
+  // Döntetlen: csak ha a saját lap paritása egyezik az ellenfél paritásával
+  // (különben nem lehet azonos a két lap értéke)
+  if (!parityOk(selectedMine)) {
+    availability.draw = false;
+  }
+
+  // Minden eredményt ellenőrzünk a possibleEnemyHands alapján
+  for (const res of ['win', 'lose', 'draw']) {
+    if (!availability[res]) continue; // már kizárva paritás alapján
+    let found = false;
+    for (const hand of possibleEnemyHands) {
+      let candidates = hand.filter(c => parityOk(c));
+      if (res === 'win')  candidates = candidates.filter(c => c < selectedMine);
+      else if (res === 'lose') candidates = candidates.filter(c => c > selectedMine);
+      else if (res === 'draw') candidates = candidates.filter(c => c === selectedMine);
+      if (candidates.length > 0) { found = true; break; }
+    }
+    if (!found) availability[res] = false;
+  }
+
+  _lastValidation = { key, result: availability };
+  return availability;
 }
 
 // =============================================
@@ -203,30 +244,37 @@ function init() {
   if (chk) {
     chk.addEventListener('change', () => {
       iStarted = chk.checked;
-
       if (iStarted) {
-        // Ha mi kezdünk: nem látjuk az ellenfél hátlapját előre
         selectedEnemy = null;
         document.getElementById('btnEven').classList.remove('active');
         document.getElementById('btnOdd').classList.remove('active');
       }
-
+      _invalidateEVCache();
       autoSelectOracleCard();
-      updateChips();
-      updateConfirmBtn();
-      renderMyCards();
-      renderEnemyCards();
-      renderOracle();
+      _refreshUI();
     });
   }
 
   autoSelectOracleCard();
   updateScoreBoard();
+  _refreshUI();
+  renderHistory();
+}
+
+// =============================================
+//  UI FRISSÍTÉS — EGYSÉGES BELÉPÉSI PONT
+//  [PERF2] Egyszer invalidál, majd minden renderelő
+//          funkció az ugyanazon _lastEVList-ből olvas
+// =============================================
+function _refreshUI() {
+  // EV lista egyszer számolódik, mind a három render ebből olvas
   renderMyCards();
   renderEnemyCards();
   renderOracle();
+  updateResultButtons(); // [UX2]
+  updatePairityButtons(); // [UX3]
   updateConfirmBtn();
-  renderHistory();
+  updateChips();
 }
 
 // =============================================
@@ -272,6 +320,42 @@ function updateScoreBoard() {
 }
 
 // =============================================
+//  [UX2] EREDMÉNY-GOMBOK TILTÁSA
+//  Win/Lose/Draw csak akkor kattintható, ha az
+//  adott eredmény lehetséges a jelenlegi állapotban
+// =============================================
+function updateResultButtons() {
+  const av = _getResultAvailability();
+
+  const btnWin  = document.getElementById('btnWin');
+  const btnLose = document.getElementById('btnLose');
+  const btnDraw = document.getElementById('btnDraw');
+
+  btnWin.disabled  = !av.win;
+  btnLose.disabled = !av.lose;
+  btnDraw.disabled = !av.draw;
+
+  // Ha a kijelölt eredmény érvénytelenné vált (pl. lapot váltottunk)
+  if (selectedResult && !av[selectedResult]) {
+    selectedResult = null;
+    btnWin.classList.remove('active');
+    btnLose.classList.remove('active');
+    btnDraw.classList.remove('active');
+  }
+}
+
+// =============================================
+//  PARITÁS-GOMBOK — mindig kattinthatók
+//  Ha ellenfél kezd: a kör előtt látjuk a hátlapot → adjuk meg előre
+//  Ha mi kezdünk: a kör UTÁN látjuk az ellenfél kezéből melyik paritás fogyott
+//  → mindkét esetben a rögzítés előtt kell megadni, mindig engedélyezett
+// =============================================
+function updatePairityButtons() {
+  document.getElementById('btnEven').disabled = false;
+  document.getElementById('btnOdd').disabled  = false;
+}
+
+// =============================================
 //  RENDER — SAJÁT LAPOK (EV badge-ekkel)
 // =============================================
 function renderMyCards() {
@@ -281,14 +365,15 @@ function renderMyCards() {
   const oddRow  = document.createElement('div'); oddRow.className  = 'cards-sub-row';
   const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
+  // [PERF2] getAllCardEVs() itt nem számol újra, a _lastEVList-ből ad vissza
   const evList = getAllCardEVs();
   const evMap  = {};
   evList.forEach(x => { evMap[x.card] = x; });
   const maxEV = evList.length > 0 ? evList[0].ev : 0;
 
   ALL_CARDS.forEach(n => {
-    const isEven    = n % 2 === 0;
-    const inHand    = myCards.includes(n);
+    const isEven     = n % 2 === 0;
+    const inHand     = myCards.includes(n);
     const isSelected = n === selectedMine;
 
     const btn = document.createElement('button');
@@ -308,8 +393,8 @@ function renderMyCards() {
     if (inHand && evMap[n] !== undefined) {
       const ev = evMap[n].ev;
       badge.textContent = ev.toFixed(1);
-      if (ev === maxEV && maxEV > 0)    badge.classList.add('chance-100');
-      else if (ev >= maxEV * 0.9)        badge.classList.add('chance-high');
+      if (ev === maxEV && maxEV > 0)  badge.classList.add('chance-100');
+      else if (ev >= maxEV * 0.9)      badge.classList.add('chance-high');
     } else {
       badge.textContent   = '—';
       badge.style.opacity = '0.3';
@@ -327,7 +412,7 @@ function renderMyCards() {
 }
 
 // =============================================
-//  RENDER — ELLENFÉL LAPOK (valószínűségekkel)
+//  RENDER — ELLENFÉL LAPOK
 // =============================================
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
@@ -339,9 +424,9 @@ function renderEnemyCards() {
   const { cardCounts, total } = _getWeightedCards(selectedEnemy);
 
   ALL_CARDS.forEach(n => {
-    const isEven  = n % 2 === 0;
-    const count   = cardCounts[n] || 0;
-    const chance  = total > 0 ? Math.round(count / total * 100) : 0;
+    const isEven   = n % 2 === 0;
+    const count    = cardCounts[n] || 0;
+    const chance   = total > 0 ? Math.round(count / total * 100) : 0;
     const possible = chance > 0;
 
     const slot = document.createElement('div');
@@ -355,13 +440,9 @@ function renderEnemyCards() {
     if (possible) {
       const chanceDiv = document.createElement('div');
       chanceDiv.className = 'enemy-chance';
-      if (chance === 100) {
-        chanceDiv.classList.add('sure-chance');
-      } else if (chance >= 70) {
-        chanceDiv.classList.add('high-chance');
-      } else if (chance <= 30) {
-        chanceDiv.classList.add('low-chance');
-      }
+      if (chance === 100)  chanceDiv.classList.add('sure-chance');
+      else if (chance >= 70) chanceDiv.classList.add('high-chance');
+      else if (chance <= 30) chanceDiv.classList.add('low-chance');
       chanceDiv.textContent = chance + '%';
       slot.appendChild(chanceDiv);
     }
@@ -384,7 +465,7 @@ function renderEnemyCards() {
 }
 
 // =============================================
-//  RENDER — ORACLE (EV-alapú javaslat)
+//  RENDER — ORACLE
 // =============================================
 function renderOracle() {
   const body = document.getElementById('oracleBody');
@@ -409,16 +490,14 @@ function renderOracle() {
     return;
   }
 
+  // [PERF2] Nem hív getAllCardEVs()-t újra, _lastEVList már megvan renderMyCards() után
   const evList = getAllCardEVs();
   if (evList.length === 0) return;
 
-  const suggestedCard = selectedMine !== null
-    ? selectedMine
-    : evList[0].card;
-
+  const suggestedCard = selectedMine !== null ? selectedMine : evList[0].card;
   const shown = evList.find(x => x.card === suggestedCard) || evList[0];
   const { ev, win, lose, draw } = shown;
-  const isEven = suggestedCard % 2 === 0;
+  const isEven    = suggestedCard % 2 === 0;
   const diff      = myScore - enemyScore;
   const remaining = myCards.length;
 
@@ -449,8 +528,8 @@ function renderOracle() {
   }
 
   const winColor = win >= 60 ? 'stat-val-green' : win >= 35 ? 'stat-val-gold' : 'stat-val-red';
-  const top4     = evList.slice(0, 4);
-  const maxEV    = evList[0].ev;
+  const top4  = evList.slice(0, 4);
+  const maxEV = evList[0].ev;
 
   body.innerHTML = `
     <div class="oracle-suggestion">
@@ -487,7 +566,6 @@ function renderOracle() {
         const isSel    = item.card === suggestedCard;
         const itemEven = item.card % 2 === 0;
         const barW     = maxEV > 0 ? Math.max(4, Math.round((item.ev / maxEV) * 60)) : 4;
-
         return `
         <div class="oracle-stat-row"
              style="${isSel ? 'background:rgba(99,60,180,0.18);border-radius:4px;padding:1px 3px;' : ''}">
@@ -514,125 +592,43 @@ function renderOracle() {
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
   selectedMine = (selectedMine === n) ? null : n;
-  renderMyCards();
-  renderOracle();
-  updateChips();
-  updateConfirmBtn();
+  // [BUG7] Lapváltáskor az EV lista és validáció invalidálódik
+  _invalidateEVCache();
+  _refreshUI();
 }
 
 function selectEnemyType(type) {
-  // [UX1] Ha mi kezdünk, a páros/páratlan gomb az UTÓLAGOS hátlaphoz kell
-  // (eredmény megadásakor), nem a döntés előtt — engedélyezzük, de jelezzük
   selectedEnemy = (selectedEnemy === type) ? null : type;
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
   if (!iStarted && selectedEnemy !== null && selectedMine === null) {
+    // Ellenfél kezdett, most látjuk a paritást: autoselect
+    _invalidateEVCache();
     autoSelectOracleCard();
+  } else {
+    _invalidateEVCache();
   }
 
-  updateChips();
-  updateConfirmBtn();
-  renderMyCards();
-  renderEnemyCards();
-  renderOracle();
+  _refreshUI();
 }
 
 function selectResult(res) {
+  // [UX2] Csak engedélyezett eredményt fogadunk el
+  const av = _getResultAvailability();
+  if (!av[res]) return; // tiltott gomb — nem csinálunk semmit
+
   selectedResult = (selectedResult === res) ? null : res;
   document.getElementById('btnWin').classList.toggle('active',  selectedResult === 'win');
   document.getElementById('btnLose').classList.toggle('active', selectedResult === 'lose');
   document.getElementById('btnDraw').classList.toggle('active', selectedResult === 'draw');
 
-  // [UX1] Azonnali validáció: lehetséges-e ez az eredmény?
-  if (selectedResult && selectedMine !== null && selectedEnemy !== null) {
-    const validation = _validateResult(selectedMine, selectedEnemy, selectedResult);
-    if (!validation.possible) {
-      showInlineError(validation.reason);
-    } else {
-      clearInlineError();
-    }
-  }
-
   updateChips();
   updateConfirmBtn();
 }
 
 // =============================================
-//  [UX1] INLINE HIBA MEGJELENÍTÉS
-//  alert() helyett a UI-ban jelenik meg
-// =============================================
-function showInlineError(msg) {
-  let errEl = document.getElementById('inlineError');
-  if (!errEl) {
-    errEl = document.createElement('div');
-    errEl.id = 'inlineError';
-    errEl.style.cssText = `
-      background: rgba(180,30,30,0.18);
-      border: 1px solid var(--crimson);
-      color: var(--crimson-light, #ff8080);
-      border-radius: 6px;
-      padding: 6px 10px;
-      font-size: 11px;
-      margin: 4px 0;
-      text-align: center;
-    `;
-    const confirmBtn = document.getElementById('btnConfirm');
-    if (confirmBtn && confirmBtn.parentNode) {
-      confirmBtn.parentNode.insertBefore(errEl, confirmBtn);
-    }
-  }
-  errEl.textContent = '⚠️ ' + msg;
-  errEl.style.display = 'block';
-}
-
-function clearInlineError() {
-  const errEl = document.getElementById('inlineError');
-  if (errEl) errEl.style.display = 'none';
-}
-
-// =============================================
-//  [BUG3 FIX] Eredmény előzetes validáció
-//  Ellenőrzi, hogy az eredmény matematikailag lehetséges-e
-//  a megadott saját lap + ellenfél paritás alapján
-// =============================================
-function _validateResult(myCard, enemyParity, result) {
-  const parityOk = enemyParity === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
-
-  // [BUG3] Döntetlen csak akkor lehetséges, ha myCard megfelelő paritású
-  if (result === 'draw') {
-    if (!parityOk(myCard)) {
-      const parLabel = enemyParity === 'even' ? 'páros' : 'páratlan';
-      return {
-        possible: false,
-        reason: `Döntetlen nem lehetséges: a te lapod (${myCard}) ${myCard % 2 === 0 ? 'páros' : 'páratlan'}, az ellenfél hátlapja ${parLabel}. Csak azonos lapnál lehet döntetlen.`
-      };
-    }
-  }
-
-  // Ellenőrzés a possibleEnemyHands alapján is
-  let candidates = [];
-  for (const hand of possibleEnemyHands) {
-    let filtered = hand.filter(c => parityOk(c));
-    if (result === 'win')  filtered = filtered.filter(c => c < myCard);
-    else if (result === 'lose') filtered = filtered.filter(c => c > myCard);
-    else if (result === 'draw') filtered = filtered.filter(c => c === myCard);
-    candidates = candidates.concat(filtered);
-  }
-
-  if (candidates.length === 0) {
-    const resLabel = { win: 'nyerés', lose: 'veszítés', draw: 'döntetlen' }[result];
-    return {
-      possible: false,
-      reason: `A jelenlegi dedukció alapján ${resLabel} nem lehetséges ezzel a lappal és paritással. Ellenőrizd az adatbevitelt!`
-    };
-  }
-
-  return { possible: true, reason: '' };
-}
-
-// =============================================
-//  [UX1] updateConfirmBtn — részletes visszajelzés
+//  GOMB ÁLLAPOT FRISSÍTŐK
 // =============================================
 function updateChips() {
   const cm = document.getElementById('chip-mine');
@@ -662,18 +658,13 @@ function updateConfirmBtn() {
   const btn  = document.getElementById('btnConfirm');
   const hint = document.getElementById('confirmHint');
 
-  // Validáció ha minden adat megvan
-  let validationOk = true;
-  if (selectedMine !== null && selectedEnemy !== null && selectedResult !== null) {
-    const v = _validateResult(selectedMine, selectedEnemy, selectedResult);
-    validationOk = v.possible;
-  }
+  const av = _getResultAvailability();
+  const resultValid = selectedResult && av[selectedResult];
 
   const canConfirm = selectedMine !== null
     && selectedEnemy !== null
-    && selectedResult !== null
-    && validationOk
-    && !isConfirming; // [BUG5] dupla-kattintás védelem
+    && resultValid
+    && !isConfirming;
 
   btn.disabled = !canConfirm;
 
@@ -684,11 +675,9 @@ function updateConfirmBtn() {
   } else if (selectedMine === null) {
     hint.textContent = '🃏 Válaszd ki a javasolt lapot (vagy más lapot)!';
   } else if (iStarted && selectedEnemy === null) {
-    hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását (mit látott a te lapodból)!';
-  } else if (selectedResult === null) {
+    hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását!';
+  } else if (!selectedResult) {
     hint.textContent = '🎯 Add meg a kör eredményét!';
-  } else if (!validationOk) {
-    hint.textContent = '⚠️ Az eredmény nem lehetséges — ellenőrizd a paritást vagy lapot!';
   } else if (canConfirm) {
     hint.textContent = '✅ Minden adat megvan — rögzítheted!';
   } else {
@@ -697,23 +686,20 @@ function updateConfirmBtn() {
 }
 
 // =============================================
-//  DEDUKCIÓS LOGIKA — JAVÍTOTT
-//  [BUG3 FIX] Döntetlen validáció paritás-ellenőrzéssel
+//  DEDUKCIÓS LOGIKA
 // =============================================
 function deduceEnemyHands(myCard, enemyType, result) {
-  let newHandsSet = new Set();
   const parityOk = enemyType === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+  let newHandsSet = new Set();
 
   for (const hand of possibleEnemyHands) {
     let candidates = hand.filter(c => parityOk(c));
-
-    if (result === 'win')  candidates = candidates.filter(c => c < myCard);
+    if (result === 'win')       candidates = candidates.filter(c => c < myCard);
     else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
     else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
 
     for (const c of candidates) {
-      const newHand = hand.filter(card => card !== c);
-      newHandsSet.add(newHand.join(','));
+      newHandsSet.add(hand.filter(card => card !== c).join(','));
     }
   }
 
@@ -721,88 +707,58 @@ function deduceEnemyHands(myCard, enemyType, result) {
     str === '' ? [] : str.split(',').map(Number)
   );
 
-  if (newHands.length === 0) {
-    // [UX1] Inline hiba, nem alert
-    showInlineError('Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Ellenőrizd az adatbevitelt.');
-    return possibleEnemyHands; // változatlanul hagyja
-  }
-
-  return newHands;
+  // Ha üres: az [UX2] elvileg megakadályozza ezt, de biztonság kedvéért
+  return newHands.length > 0 ? newHands : possibleEnemyHands;
 }
 
 // =============================================
 //  CONFIRM ROUND
-//  [BUG4 FIX] selectedEnemy reset iStarted alapján
-//  [BUG5 FIX] dupla-kattintás védelem isConfirming flag-gel
 // =============================================
 function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
-  if (isConfirming) return; // [BUG5]
+  if (isConfirming) return;
 
-  // Előzetes validáció
-  const validation = _validateResult(selectedMine, selectedEnemy, selectedResult);
-  if (!validation.possible) {
-    showInlineError(validation.reason);
-    return;
-  }
-
-  // [BUG5] Dupla-kattintás tiltás
   isConfirming = true;
   const confirmBtn = document.getElementById('btnConfirm');
-  if (confirmBtn) {
-    confirmBtn.disabled = true;
-    confirmBtn.textContent = '⏳ Rögzítés...';
-  }
+  if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = '⏳ Rögzítés...'; }
 
-  // Snapshot mentése undo-hoz
   history.push({
     myCards: [...myCards],
     possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
     myScore, enemyScore, selectedMine, selectedEnemy, selectedResult, iStarted, roundNum
   });
 
-  // Pontok frissítése
-  if (selectedResult === 'win')  myScore++;
+  if (selectedResult === 'win')       myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
-  // Dedukció
   possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
-
-  // Saját lap kizárása
   myCards = myCards.filter(c => c !== selectedMine);
 
-  // History napló
-  const labels      = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
-  const enemyLabel  = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
-                      + (iStarted ? ' (én kezdtem)' : '');
+  const labels     = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+  const enemyLabel = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
+                     + (iStarted ? ' (én kezdtem)' : '');
   const resultClass = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[selectedResult];
 
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
 
-  // [BUG4 FIX] Reset: selectedEnemy törlése ha mi kezdünk a következő körben is
-  // (iStarted állapota megmarad, de az ellenfél hátlapját minden körben újra kell megadni)
   selectedMine = null;
   selectedResult = null;
-  // selectedEnemy-t csak akkor tartjuk meg ha ellenfél kezd ÉS a UI megköveteli;
-  // de valójában minden körben új lap kerül le → mindig nullázunk
   selectedEnemy = null;
 
   clearActionButtons();
-  clearInlineError();
 
-  // [BUG5] Confirm védelem feloldása rövid késleltetéssel (animáció után)
+  // [PERF1] EV cache törlése csak itt, körváltáskor
+  _evCache.clear();
+  _invalidateEVCache();
+
   setTimeout(() => {
     isConfirming = false;
     if (confirmBtn) confirmBtn.textContent = '✦ Rögzítés';
     autoSelectOracleCard();
     updateScoreBoard();
-    renderMyCards();
-    renderEnemyCards();
-    renderOracle();
-    updateConfirmBtn();
-    updateChips();
-  }, 150);
+    _refreshUI();
+  }, 80);
 }
 
 // =============================================
@@ -811,7 +767,6 @@ function confirmRound() {
 function addHistoryEntry(round, mine, enemy, result, cls) {
   const list = document.getElementById('historyList');
   if (list.querySelector('.history-empty')) list.innerHTML = '';
-
   const entry = document.createElement('div');
   entry.className = 'history-entry';
   entry.innerHTML = `<span class="h-round">#${round}</span> <span class="h-mine">Én: ${mine}</span> <span class="h-enemy">Ell: ${enemy}</span> <span class="${cls}">${result}</span>`;
@@ -845,12 +800,14 @@ function undoLast() {
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
   clearActionButtons();
-  clearInlineError();
+
+  _evCache.clear();
+  _invalidateEVCache();
 
   autoSelectOracleCard();
-  updateScoreBoard(); renderHistory();
-  renderMyCards(); renderEnemyCards(); renderOracle();
-  updateConfirmBtn(); updateChips();
+  updateScoreBoard();
+  renderHistory();
+  _refreshUI();
 }
 
 function resetAll() {
@@ -866,11 +823,13 @@ function resetAll() {
   iStarted = false;
 
   clearActionButtons();
-  clearInlineError();
+  _evCache.clear();
+  _invalidateEVCache();
+
   autoSelectOracleCard();
   updateScoreBoard();
-  renderMyCards(); renderEnemyCards(); renderOracle();
-  updateConfirmBtn(); updateChips(); renderHistory();
+  _refreshUI();
+  renderHistory();
 }
 
 function clearActionButtons() {
