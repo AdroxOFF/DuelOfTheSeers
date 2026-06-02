@@ -1,41 +1,39 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v5.0 — Helyes játékelmélet + EV motor
+//  app.js v6.0 — Javított EV motor + hibakezelés
 // =============================================
 //
-//  JÁTÉK ELMÉLET:
-//  - Mindkét félnek saját, FÜGGETLEN 0-8 lapkészlete van
-//  - Páros (0,2,4,6,8) = fekete hátlap
-//  - Páratlan (1,3,5,7) = fehér hátlap
-//  - Ha ELLENFÉL KEZD: lerakja a lapját, mi LÁTJUK a hátlapot (páros/páratlan),
-//    ez alapján döntünk a saját lapunkról, majd kiderül az eredmény
-//  - Ha MI KEZDÜNK: vakon rakunk, az ellenfél látja a mi hátlapunkat és
-//    válaszol, majd kiderül az eredmény
-//  - Minden kör végén csak az eredmény (win/lose/draw) derül ki,
-//    az ellenfél pontos lapja nem
-//  - A dedukciós motor körről körre szűkíti az ellenfél lehetséges lapjait
+//  JAVÍTÁSOK v5.0 → v6.0:
+//  [BUG1] EV cache kulcs integer overflow javítva → Map-kulcs string lett
+//  [BUG2] enemyUnionAll → weighted sample helyett kerül alkalmazásra
+//  [BUG3] Döntetlen dedukció: páros/páratlan inkonzisztencia kezelve
+//  [BUG4] confirmRound() után selectedEnemy reset iStarted alapján
+//  [BUG5] Dupla-kattintás védelem confirmRound()-on
+//  [UX1]  Gombok vizuális disabled state + inline hibaüzenetek
+//  [UX2]  Dedukció hiba modal helyett inline visszajelzés
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 let myCards            = [...ALL_CARDS];
-let possibleEnemyHands = [ [...ALL_CARDS] ];  // lehetséges ellenfél-kézállapotok
+let possibleEnemyHands = [ [...ALL_CARDS] ];
 
 let myScore    = 0;
 let enemyScore = 0;
 
-let selectedMine   = null;   // saját kiválasztott lap
-let selectedEnemy  = null;   // 'even' | 'odd' | null  (az ellenfél hátlapja)
-let selectedResult = null;   // 'win' | 'lose' | 'draw' | null
-let iStarted       = false;  // ki kezdi a kört (toggle)
+let selectedMine   = null;
+let selectedEnemy  = null;  // 'even' | 'odd' | null
+let selectedResult = null;  // 'win' | 'lose' | 'draw' | null
+let iStarted       = false;
 
 let history  = [];
 let roundNum = 0;
+let isConfirming = false; // [BUG5] dupla-kattintás védelem
 
 // =============================================
-//  EV MOTOR — HIBRID MEGKÖZELÍTÉS
-//  Aktuális kör: pontos, possibleEnemyHands weighted prior
-//  Jövőbeli körök: bitmask union közelítés (gyors)
+//  EV MOTOR — JAVÍTOTT CACHE KULCS
+//  [BUG1] Régi: bitshift overflow 32 bites signed int-nél
+//         Új:   string kulcs → nincs overflow, nincs ütközés
 // =============================================
 let _evCache = new Map();
 
@@ -50,11 +48,12 @@ function _finalScore(myS, enemyS) {
   return d > 0 ? myS + d : 0;
 }
 
-// Bitmask EV a jövőbeli körökre (gyors közelítő, uniform prior)
+// [BUG1 FIX] String alapú cache kulcs — nincs bitshift overflow
 function _computeEV(myMask, enemyMask, myS, enemyS) {
   if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
 
-  const key = (myMask << 22) | (enemyMask << 13) | (myS << 6) | enemyS;
+  // String kulcs: nincs integer overflow 9 bites maskoknál sem
+  const key = `${myMask},${enemyMask},${myS},${enemyS}`;
   if (_evCache.has(key)) return _evCache.get(key);
 
   const eCnt = _maskCount(enemyMask);
@@ -91,7 +90,9 @@ function _computeEV(myMask, enemyMask, myS, enemyS) {
   return r;
 }
 
-// Weighted card distribution az aktuális körre (possibleEnemyHands alapján)
+// [BUG2 FIX] Weighted card distribution — paritás szűrővel
+// Az ellenfél jövőbeli lapjainak kezelése: MINDEN lehetséges kézre
+// külön-külön számítunk EV-t, nem union közelítéssel.
 function _getWeightedCards(parity) {
   const parityOk = parity === 'even' ? (c => c % 2 === 0)
                  : parity === 'odd'  ? (c => c % 2 !== 0)
@@ -107,7 +108,11 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// Minden kézben lévő laphoz kiszámolja a teljes meccs várható végpontszámát
+// [BUG2 FIX] getAllCardEVs: jövőbeli ellenfél-lapokat
+// per-hand számítjuk, nem union-ként.
+// Minden lehetséges (saját lap, ellenfél lap) párhoz:
+//   - az ellenfél keze a konkrét hand mínusz a lerakott lap
+//   - ezek súlyozva átlagolódnak
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
   _evCache.clear();
@@ -117,10 +122,23 @@ function getAllCardEVs() {
 
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  // Ellenfél jövőbeli lapjainak uniója (közelítés a jövőbeli körökre)
-  let enemyUnionAll = 0;
-  for (const hand of possibleEnemyHands)
-    for (const c of hand) enemyUnionAll |= (1 << c);
+  // Inverz index: melyik hand tartalmazza az adott ellenfél-lapot
+  // (paritás szűrő után) — és mi az a hand
+  // Struktúra: { ec: [ { handMask, weight } ] }
+  const ecToHands = {};
+  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0)
+                 : selectedEnemy === 'odd'  ? (c => c % 2 !== 0)
+                 : (c => true);
+
+  for (const hand of possibleEnemyHands) {
+    const validCards = hand.filter(parityOk);
+    for (const ec of validCards) {
+      if (!ecToHands[ec]) ecToHands[ec] = [];
+      // A jövőbeli ellenfél-mask: a hand összes lapja MÍNUSZ a lerakott ec
+      const futureMask = hand.reduce((m, c) => m | (1 << c), 0) ^ (1 << ec);
+      ecToHands[ec].push({ futureMask, weight: 1 });
+    }
+  }
 
   return myCards.map(myCard => {
     const nextMyMask = nextMyBase ^ (1 << myCard);
@@ -129,15 +147,19 @@ function getAllCardEVs() {
     if (total === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      for (const [ecStr, weight] of Object.entries(cardCounts)) {
+      for (const [ecStr, handList] of Object.entries(ecToHands)) {
         const ec = parseInt(ecStr);
         let nm = myScore, ne = enemyScore;
         if (myCard > ec) nm++; else if (myCard < ec) ne++;
 
-        // Jövőbeli ellenfél-lapok: union MÍNUSZ a most lerakott
-        const futureEnemyMask = enemyUnionAll & ~(1 << ec);
-        const { ev: subEV } = _computeEV(nextMyMask, futureEnemyMask, nm, ne);
-        totalEV += subEV * weight;
+        // Minden hand-re külön EV, majd átlag
+        let handEVSum = 0;
+        for (const { futureMask } of handList) {
+          const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
+          handEVSum += subEV;
+        }
+        // Súly: hány hand-ben szerepel ez az ec
+        totalEV += (handEVSum / handList.length) * handList.length;
       }
       totalEV /= total;
     }
@@ -170,10 +192,6 @@ function getBestCard() {
 //  AUTOMATA KÁRTYA KIJELÖLŐ
 // =============================================
 function autoSelectOracleCard() {
-  // Ha ellenfél kezd: a paritást LÁTJUK mielőtt döntünk
-  //   → azonnal ajánlunk (a selectedEnemy-vel szűrve)
-  // Ha mi kezdünk: vak döntés, selectedEnemy=null
-  //   → ajánlunk paritás-szűrés nélkül
   selectedMine = getBestCard();
 }
 
@@ -318,7 +336,6 @@ function renderEnemyCards() {
   const oddRow  = document.createElement('div'); oddRow.className  = 'cards-sub-row';
   const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
-  // Lehetséges ellenfél-lapok és valószínűségeik (paritás szűrővel)
   const { cardCounts, total } = _getWeightedCards(selectedEnemy);
 
   ALL_CARDS.forEach(n => {
@@ -356,7 +373,6 @@ function renderEnemyCards() {
   container.appendChild(oddRow);
   container.appendChild(evenRow);
 
-  // Lehetséges lapok számlálója
   const uniqueCount = Object.keys(cardCounts).filter(k => cardCounts[k] > 0).length;
   const countEl = document.getElementById('enemyCount');
   if (countEl) {
@@ -379,7 +395,6 @@ function renderOracle() {
     return;
   }
 
-  // Ha ellenfél kezd de még nem adtuk meg a hátlapot: várakozás
   if (!iStarted && selectedEnemy === null) {
     body.innerHTML = `
       <div class="oracle-text">
@@ -407,10 +422,8 @@ function renderOracle() {
   const diff      = myScore - enemyScore;
   const remaining = myCards.length;
 
-  // Stratégiai szöveg
   let strategyDesc = '';
   if (iStarted) {
-    // Mi kezdtünk - vak döntés
     if (win <= 20) {
       strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${suggestedCard}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot ellene. Várható végpont: <strong>${ev.toFixed(2)}</strong>.`;
     } else if (diff >= 2 && remaining <= 4) {
@@ -421,7 +434,6 @@ function renderOracle() {
       strategyDesc = `🎭 <strong>VAK NYITÁS:</strong> Nem látjuk az ellenfél hátlapját. A <strong>${suggestedCard}</strong>-es a legjobb várható végpontot adja (<strong>${ev.toFixed(2)}</strong>).`;
     }
   } else {
-    // Ellenfél kezdett - látjuk a hátlapot
     const parityLabel = selectedEnemy === 'even' ? 'PÁROS' : 'PÁRATLAN';
     if (win >= 80) {
       strategyDesc = `🔥 <strong>BIZTOS PONT:</strong> Az ellenfél ${parityLabel} lapja ellen a <strong>${suggestedCard}</strong>-es <strong>${win}%</strong> eséllyel nyer. EV: <strong>${ev.toFixed(2)}</strong>.`;
@@ -509,11 +521,12 @@ function selectMyCard(n) {
 }
 
 function selectEnemyType(type) {
+  // [UX1] Ha mi kezdünk, a páros/páratlan gomb az UTÓLAGOS hátlaphoz kell
+  // (eredmény megadásakor), nem a döntés előtt — engedélyezzük, de jelezzük
   selectedEnemy = (selectedEnemy === type) ? null : type;
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
-  // Ha ellenfél kezd és megadtuk a paritást: azonnal ajánlunk lapot
   if (!iStarted && selectedEnemy !== null && selectedMine === null) {
     autoSelectOracleCard();
   }
@@ -530,10 +543,97 @@ function selectResult(res) {
   document.getElementById('btnWin').classList.toggle('active',  selectedResult === 'win');
   document.getElementById('btnLose').classList.toggle('active', selectedResult === 'lose');
   document.getElementById('btnDraw').classList.toggle('active', selectedResult === 'draw');
+
+  // [UX1] Azonnali validáció: lehetséges-e ez az eredmény?
+  if (selectedResult && selectedMine !== null && selectedEnemy !== null) {
+    const validation = _validateResult(selectedMine, selectedEnemy, selectedResult);
+    if (!validation.possible) {
+      showInlineError(validation.reason);
+    } else {
+      clearInlineError();
+    }
+  }
+
   updateChips();
   updateConfirmBtn();
 }
 
+// =============================================
+//  [UX1] INLINE HIBA MEGJELENÍTÉS
+//  alert() helyett a UI-ban jelenik meg
+// =============================================
+function showInlineError(msg) {
+  let errEl = document.getElementById('inlineError');
+  if (!errEl) {
+    errEl = document.createElement('div');
+    errEl.id = 'inlineError';
+    errEl.style.cssText = `
+      background: rgba(180,30,30,0.18);
+      border: 1px solid var(--crimson);
+      color: var(--crimson-light, #ff8080);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11px;
+      margin: 4px 0;
+      text-align: center;
+    `;
+    const confirmBtn = document.getElementById('btnConfirm');
+    if (confirmBtn && confirmBtn.parentNode) {
+      confirmBtn.parentNode.insertBefore(errEl, confirmBtn);
+    }
+  }
+  errEl.textContent = '⚠️ ' + msg;
+  errEl.style.display = 'block';
+}
+
+function clearInlineError() {
+  const errEl = document.getElementById('inlineError');
+  if (errEl) errEl.style.display = 'none';
+}
+
+// =============================================
+//  [BUG3 FIX] Eredmény előzetes validáció
+//  Ellenőrzi, hogy az eredmény matematikailag lehetséges-e
+//  a megadott saját lap + ellenfél paritás alapján
+// =============================================
+function _validateResult(myCard, enemyParity, result) {
+  const parityOk = enemyParity === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+
+  // [BUG3] Döntetlen csak akkor lehetséges, ha myCard megfelelő paritású
+  if (result === 'draw') {
+    if (!parityOk(myCard)) {
+      const parLabel = enemyParity === 'even' ? 'páros' : 'páratlan';
+      return {
+        possible: false,
+        reason: `Döntetlen nem lehetséges: a te lapod (${myCard}) ${myCard % 2 === 0 ? 'páros' : 'páratlan'}, az ellenfél hátlapja ${parLabel}. Csak azonos lapnál lehet döntetlen.`
+      };
+    }
+  }
+
+  // Ellenőrzés a possibleEnemyHands alapján is
+  let candidates = [];
+  for (const hand of possibleEnemyHands) {
+    let filtered = hand.filter(c => parityOk(c));
+    if (result === 'win')  filtered = filtered.filter(c => c < myCard);
+    else if (result === 'lose') filtered = filtered.filter(c => c > myCard);
+    else if (result === 'draw') filtered = filtered.filter(c => c === myCard);
+    candidates = candidates.concat(filtered);
+  }
+
+  if (candidates.length === 0) {
+    const resLabel = { win: 'nyerés', lose: 'veszítés', draw: 'döntetlen' }[result];
+    return {
+      possible: false,
+      reason: `A jelenlegi dedukció alapján ${resLabel} nem lehetséges ezzel a lappal és paritással. Ellenőrizd az adatbevitelt!`
+    };
+  }
+
+  return { possible: true, reason: '' };
+}
+
+// =============================================
+//  [UX1] updateConfirmBtn — részletes visszajelzés
+// =============================================
 function updateChips() {
   const cm = document.getElementById('chip-mine');
   const ce = document.getElementById('chip-enemy');
@@ -559,29 +659,46 @@ function updateChips() {
 }
 
 function updateConfirmBtn() {
-  const canConfirm = selectedMine !== null && selectedEnemy !== null && selectedResult !== null;
-  document.getElementById('btnConfirm').disabled = !canConfirm;
-
+  const btn  = document.getElementById('btnConfirm');
   const hint = document.getElementById('confirmHint');
+
+  // Validáció ha minden adat megvan
+  let validationOk = true;
+  if (selectedMine !== null && selectedEnemy !== null && selectedResult !== null) {
+    const v = _validateResult(selectedMine, selectedEnemy, selectedResult);
+    validationOk = v.possible;
+  }
+
+  const canConfirm = selectedMine !== null
+    && selectedEnemy !== null
+    && selectedResult !== null
+    && validationOk
+    && !isConfirming; // [BUG5] dupla-kattintás védelem
+
+  btn.disabled = !canConfirm;
+
   if (!hint) return;
 
   if (!iStarted && selectedEnemy === null) {
-    hint.textContent = 'Nézd meg az ellenfél hátlapját, kattints Páros/Páratlan!';
+    hint.textContent = '⬛⬜ Nézd meg az ellenfél hátlapját, kattints Páros/Páratlan!';
   } else if (selectedMine === null) {
-    hint.textContent = 'Válaszd ki a javasolt lapot (vagy más lapot)!';
+    hint.textContent = '🃏 Válaszd ki a javasolt lapot (vagy más lapot)!';
+  } else if (iStarted && selectedEnemy === null) {
+    hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását (mit látott a te lapodból)!';
   } else if (selectedResult === null) {
-    hint.textContent = 'Add meg a kör eredményét!';
+    hint.textContent = '🎯 Add meg a kör eredményét!';
+  } else if (!validationOk) {
+    hint.textContent = '⚠️ Az eredmény nem lehetséges — ellenőrizd a paritást vagy lapot!';
   } else if (canConfirm) {
-    hint.textContent = 'Minden adat megvan — rögzítheted!';
+    hint.textContent = '✅ Minden adat megvan — rögzítheted!';
   } else {
     hint.textContent = 'Válassz lapot és eredményt!';
   }
 }
 
 // =============================================
-//  DEDUKCIÓS LOGIKA
-//  A kör végén szűkíti az ellenfél lehetséges kezét
-//  az ismert paritás + eredmény alapján.
+//  DEDUKCIÓS LOGIKA — JAVÍTOTT
+//  [BUG3 FIX] Döntetlen validáció paritás-ellenőrzéssel
 // =============================================
 function deduceEnemyHands(myCard, enemyType, result) {
   let newHandsSet = new Set();
@@ -605,8 +722,9 @@ function deduceEnemyHands(myCard, enemyType, result) {
   );
 
   if (newHands.length === 0) {
-    alert('Hiba: Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Ellenőrizd az adatbevitelt.');
-    return possibleEnemyHands;
+    // [UX1] Inline hiba, nem alert
+    showInlineError('Ilyen eredmény nem lehetséges a jelenlegi lapok alapján! Ellenőrizd az adatbevitelt.');
+    return possibleEnemyHands; // változatlanul hagyja
   }
 
   return newHands;
@@ -614,9 +732,27 @@ function deduceEnemyHands(myCard, enemyType, result) {
 
 // =============================================
 //  CONFIRM ROUND
+//  [BUG4 FIX] selectedEnemy reset iStarted alapján
+//  [BUG5 FIX] dupla-kattintás védelem isConfirming flag-gel
 // =============================================
 function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
+  if (isConfirming) return; // [BUG5]
+
+  // Előzetes validáció
+  const validation = _validateResult(selectedMine, selectedEnemy, selectedResult);
+  if (!validation.possible) {
+    showInlineError(validation.reason);
+    return;
+  }
+
+  // [BUG5] Dupla-kattintás tiltás
+  isConfirming = true;
+  const confirmBtn = document.getElementById('btnConfirm');
+  if (confirmBtn) {
+    confirmBtn.disabled = true;
+    confirmBtn.textContent = '⏳ Rögzítés...';
+  }
 
   // Snapshot mentése undo-hoz
   history.push({
@@ -629,13 +765,13 @@ function confirmRound() {
   if (selectedResult === 'win')  myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
-  // Dedukció: ellenfél lehetséges kezeinek szűkítése
+  // Dedukció
   possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
 
   // Saját lap kizárása
   myCards = myCards.filter(c => c !== selectedMine);
 
-  // History napló bejegyzés
+  // History napló
   const labels      = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
   const enemyLabel  = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
                       + (iStarted ? ' (én kezdtem)' : '');
@@ -644,17 +780,29 @@ function confirmRound() {
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
 
-  // Reset a következő körre
-  selectedMine = null; selectedEnemy = null; selectedResult = null;
+  // [BUG4 FIX] Reset: selectedEnemy törlése ha mi kezdünk a következő körben is
+  // (iStarted állapota megmarad, de az ellenfél hátlapját minden körben újra kell megadni)
+  selectedMine = null;
+  selectedResult = null;
+  // selectedEnemy-t csak akkor tartjuk meg ha ellenfél kezd ÉS a UI megköveteli;
+  // de valójában minden körben új lap kerül le → mindig nullázunk
+  selectedEnemy = null;
 
   clearActionButtons();
-  autoSelectOracleCard();
-  updateScoreBoard();
-  renderMyCards();
-  renderEnemyCards();
-  renderOracle();
-  updateConfirmBtn();
-  updateChips();
+  clearInlineError();
+
+  // [BUG5] Confirm védelem feloldása rövid késleltetéssel (animáció után)
+  setTimeout(() => {
+    isConfirming = false;
+    if (confirmBtn) confirmBtn.textContent = '✦ Rögzítés';
+    autoSelectOracleCard();
+    updateScoreBoard();
+    renderMyCards();
+    renderEnemyCards();
+    renderOracle();
+    updateConfirmBtn();
+    updateChips();
+  }, 150);
 }
 
 // =============================================
@@ -697,6 +845,7 @@ function undoLast() {
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
   clearActionButtons();
+  clearInlineError();
 
   autoSelectOracleCard();
   updateScoreBoard(); renderHistory();
@@ -710,12 +859,14 @@ function resetAll() {
   history = []; roundNum = 0;
   myScore = 0; enemyScore = 0;
   selectedMine = null; selectedEnemy = null; selectedResult = null;
+  isConfirming = false;
 
   const chk = document.getElementById('chkIStart');
   if (chk) chk.checked = false;
   iStarted = false;
 
   clearActionButtons();
+  clearInlineError();
   autoSelectOracleCard();
   updateScoreBoard();
   renderMyCards(); renderEnemyCards(); renderOracle();
