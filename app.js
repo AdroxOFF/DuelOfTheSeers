@@ -602,12 +602,12 @@ function selectEnemyType(type) {
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
-  if (!iStarted && selectedEnemy !== null && selectedMine === null) {
-    // Ellenfél kezdett, most látjuk a paritást: autoselect
-    _invalidateEVCache();
+  // Paritásváltáskor mindig újraszámoljuk az EV-t — az ellenfél lehetséges
+  // lapkészlete megváltozik a páros/páratlan szűrővel.
+  // Ha a felhasználó még nem választott lapot manuálisan, az ajánlást is frissítjük.
+  _invalidateEVCache();
+  if (selectedMine === null) {
     autoSelectOracleCard();
-  } else {
-    _invalidateEVCache();
   }
 
   _refreshUI();
