@@ -34,6 +34,7 @@ let iStarted       = false;
 let history  = [];
 let roundNum = 0;
 let isConfirming = false;
+let _cardManuallySelected = false; // true ha a user kézzel választott lapot (nem autoselect)
 
 // =============================================
 //  EV MOTOR
@@ -234,6 +235,7 @@ function _getResultAvailability() {
 // =============================================
 function autoSelectOracleCard() {
   selectedMine = getBestCard();
+  _cardManuallySelected = false; // autoselect → nem manuális
 }
 
 // =============================================
@@ -591,9 +593,16 @@ function renderOracle() {
 // =============================================
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
-  selectedMine = (selectedMine === n) ? null : n;
-  // [BUG7] Lapváltáskor az EV lista és validáció invalidálódik
-  _invalidateEVCache();
+  if (selectedMine === n) {
+    // toggle: visszakapcsolás autoselectre
+    _cardManuallySelected = false;
+    _invalidateEVCache();
+    autoSelectOracleCard();
+  } else {
+    selectedMine = n;
+    _cardManuallySelected = true; // manuális választás
+    _invalidateEVCache();
+  }
   _refreshUI();
 }
 
@@ -604,9 +613,10 @@ function selectEnemyType(type) {
 
   // Paritásváltáskor mindig újraszámoljuk az EV-t — az ellenfél lehetséges
   // lapkészlete megváltozik a páros/páratlan szűrővel.
-  // Ha a felhasználó még nem választott lapot manuálisan, az ajánlást is frissítjük.
+  // Ha a user NEM választott manuálisan lapot, az ajánlást is frissítjük.
+  // (manuális választásnál megtartjuk a lapot, csak az EV értékek frissülnek)
   _invalidateEVCache();
-  if (selectedMine === null) {
+  if (!_cardManuallySelected) {
     autoSelectOracleCard();
   }
 
@@ -745,6 +755,7 @@ function confirmRound() {
   selectedMine = null;
   selectedResult = null;
   selectedEnemy = null;
+  _cardManuallySelected = false;
 
   clearActionButtons();
 
@@ -799,6 +810,7 @@ function undoLast() {
   roundNum           = snap.roundNum;
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
+  _cardManuallySelected = false;
   clearActionButtons();
 
   _evCache.clear();
@@ -817,6 +829,7 @@ function resetAll() {
   myScore = 0; enemyScore = 0;
   selectedMine = null; selectedEnemy = null; selectedResult = null;
   isConfirming = false;
+  _cardManuallySelected = false;
 
   const chk = document.getElementById('chkIStart');
   if (chk) chk.checked = false;
