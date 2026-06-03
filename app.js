@@ -1,19 +1,19 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v11.0 (Single Source of Truth)
+//  app.js v11.1 (Clean Architecture Edition)
 // =============================================
 //
-//  JAVÍTÁSOK v10.7 → v11.0:
-//  [ARCH-1] DRY (Don't Repeat Yourself) struktúra: A matematikai
-//           függvények (EV motor, Bayes) Szigorúan csak EGYSZER 
-//           vannak definiálva.
-//  [ARCH-2] A Web Worker ezentúl .toString() injekcióval kapja meg 
-//           az algoritmust. A Worker és a Main thread garantáltan 
-//           100%-ig azonos logikát futtat. Nincs több "silent drift".
-//  [FIX-1]  Cache Collision (túlcsordulás) javítva: az fp generálás 
-//           biztonságos stringgé lett alakítva a 32-bites limit miatt.
-//  [FIX-2]  A Vak Kezdés (selectedEnemy === null) Tie-Breaker 
-//           most már egységesen fut az egész rendszerben.
+//  JAVÍTÁSOK v11.0 → v11.1 (Perplexity iránymutatása alapján):
+//  [REF-1] calculateFinalCoins(): A végső pontszám logikája
+//          kiemelve egyetlen közös függvénybe. Az EV motor, a
+//          Scoreboard és a Jövőkép is kizárólag ezt használja.
+//  [REF-2] compareCardEVs(): A Vak Kezdés és a Tie-Breaker logika
+//          egyesítve egyetlen tiszta helper függvényben.
+//  [REF-3] _getCacheKey(): Fast/String path kettősség megszüntetve.
+//          Minden állapotra ugyanaz a stabil, biztonságos string
+//          fingerprint generálódik.
+//  [REF-4] mergeEquivalentHands(): Garantált bemeneti rendezés (sort),
+//          hogy az azonos kezek sose csússzanak szét.
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -34,48 +34,54 @@ let roundNum = 0;
 let isConfirming = false;
 let _cardManuallySelected = false;
 
-
 // ============================================================================
-//  1. RÉSZ: A KÖZÖS MATEMATIKAI MAG (PURE FUNCTIONS)
-//  Ezek a függvények csak itt léteznek. A főszál és a Worker is ezt használja.
+//  1. KÖZÖS MAG (PURE FUNCTIONS) — A Worker és a Főszál is ezt használja
 // ============================================================================
 
 function enemyPlayWeight(card) { 
   return 1; 
 }
 
-function _finalScore(myS, enemyS) {
+// [REF-1] Egységes érme/pont kalkulátor a Metin2 szabályai szerint
+function calculateFinalCoins(myS, enemyS) {
   const d = myS - enemyS;
-  if (d > 0) return myS + d;
-  return myS;
+  return d > 0 ? myS + d : myS;
 }
 
+// [REF-2] Egységes Tie-Breaker (Döntetlen-törő) rendező logika
+function compareCardEVs(a, b, isBlind, losePrefer) {
+  const diff = b.ev - a.ev;
+  // 1. Ha az EV egyértelműen különbözik, az dönt
+  if (Math.abs(diff) > 0.0001) return diff; 
+  
+  // 2. Ha Vak Kezdés van (isBlind = true), mindig a legkisebb lapot áldozzuk be
+  if (isBlind) return a.card - b.card;
+  
+  // 3. Ha Látó Kezdés van, és egyforma az EV: vesztésnél nagy lap, nyerésnél kicsi
+  return losePrefer ? b.card - a.card : a.card - b.card;
+}
+
+// [REF-3] Egységes, biztonságos Cache Kulcs generátor
 function _getCacheKey(states, myMask, myS, enemyS) {
-  if (states.length === 1) {
-    let eMask = 0;
-    const h = states[0].hand;
-    for (let i = 0; i < h.length; i++) eMask |= (1 << h[i]);
-    // 32-bites fast path (Nincs string allokáció)
-    return (eMask << 18) | (myMask << 9) | (myS << 4) | enemyS;
-  }
-  // Biztonságos string kulcs (nincs integer túlcsordulás)
   let fp = '';
   for (let i = 0; i < states.length; i++) {
     let m = 0;
     const h = states[i].hand;
     for (let j = 0; j < h.length; j++) m |= (1 << h[j]);
-    fp += m + ':' + Math.round(states[i].weight * 1000) + '|';
+    fp += m + ':' + Math.round(states[i].weight * 10000) + '|';
   }
   return fp + myMask + '_' + myS + '_' + enemyS;
 }
 
+// [REF-4] Garantált rendezés a duplikációk ellen
 function mergeEquivalentHands(states) {
   const map = new Map();
   for (let i = 0; i < states.length; i++) {
     const s = states[i];
-    const key = s.hand.join(',');
+    const sorted = s.hand.slice().sort((a, b) => a - b);
+    const key = sorted.join(',');
     if (!map.has(key)) {
-      map.set(key, { hand: s.hand, weight: s.weight });
+      map.set(key, { hand: sorted, weight: s.weight });
     } else {
       map.get(key).weight += s.weight;
     }
@@ -90,21 +96,14 @@ function normalizeWeights(states) {
 }
 
 function _buildNextStates(states, playedStateIndex, ec) {
-  if (states.length === 1) {
-    const h = states[0].hand;
-    const newHand = [];
-    for (let i = 0; i < h.length; i++) {
-      if (h[i] !== ec) newHand.push(h[i]);
-    }
-    return [{ hand: newHand, weight: states[0].weight }];
-  }
-
   const next = [];
   for (let i = 0; i < states.length; i++) {
     const s = states[i];
     if (i === playedStateIndex) {
       const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
+      if (newHand.length > 0 || states.length === 1) {
+        next.push({ hand: newHand, weight: s.weight });
+      }
     } else {
       next.push(s);
     }
@@ -115,7 +114,7 @@ function _buildNextStates(states, playedStateIndex, ec) {
 }
 
 function _computeEV(states, myMask, myS, enemyS, cache) {
-  if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
+  if (myMask === 0) return { ev: calculateFinalCoins(myS, enemyS), best: -1 };
 
   const key = _getCacheKey(states, myMask, myS, enemyS);
   if (cache.has(key)) return cache.get(key);
@@ -125,7 +124,7 @@ function _computeEV(states, myMask, myS, enemyS, cache) {
 
   const totalStateWeight = states.reduce((s, x) => s + x.weight, 0);
   if (totalStateWeight === 0) {
-    const r = { ev: _finalScore(myS, enemyS), best: -1 };
+    const r = { ev: calculateFinalCoins(myS, enemyS), best: -1 };
     cache.set(key, r);
     return r;
   }
@@ -172,15 +171,6 @@ function _parityOk(parity) {
 }
 
 function _buildNextStatesFromFull(possibleEnemyHands, ec, originIndex) {
-  if (possibleEnemyHands.length === 1) {
-    const h = possibleEnemyHands[0].hand;
-    const newHand = [];
-    for (let i = 0; i < h.length; i++) {
-      if (h[i] !== ec) newHand.push(h[i]);
-    }
-    return [{ hand: newHand, weight: possibleEnemyHands[0].weight }];
-  }
-
   const next = [];
   for (let i = 0; i < possibleEnemyHands.length; i++) {
     const s = possibleEnemyHands[i];
@@ -201,6 +191,7 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
 
   const ok = _parityOk(selectedEnemy);
   const losePrefer = myScore < enemyScore;
+  const isBlind = (selectedEnemy === null);
   const myMask = myCards.reduce((m, c) => m | (1 << c), 0);
 
   const filteredStates = [];
@@ -212,24 +203,10 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     }
   }
 
-  function _finalScoreLocal(myS, enemyS) {
-    const d = myS - enemyS;
-    if (d > 0) return myS + d;
-    return myS;
-  }
-
-  // Vak Kezdés Tie-Breaker Helper
-  const sorter = (a, b) => {
-    const diff = b.ev - a.ev;
-    if (Math.abs(diff) > 0.0001) return diff;
-    if (selectedEnemy === null) return a.card - b.card; // Vaknál mindig kis lapot áldozunk
-    return losePrefer ? b.card - a.card : a.card - b.card;
-  };
-
   if (filteredStates.length === 0) {
     return myCards.map(myCard => ({
-      card: myCard, ev: _finalScoreLocal(myScore, enemyScore), win: 0, lose: 0, draw: 0
-    })).sort(sorter);
+      card: myCard, ev: calculateFinalCoins(myScore, enemyScore), win: 0, lose: 0, draw: 0
+    })).sort((a, b) => compareCardEVs(a, b, isBlind, losePrefer));
   }
 
   const filteredNorm = filteredStates.map(s => ({ hand: [...s.hand], weight: s.weight, originIndex: s.originIndex }));
@@ -267,13 +244,11 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     return {
       card: myCard, ev: totalEV, win: Math.round(w * 100), lose: Math.round(l * 100), draw: Math.round(d * 100)
     };
-  }).sort(sorter);
+  }).sort((a, b) => compareCardEVs(a, b, isBlind, losePrefer));
 }
 
-
 // ============================================================================
-//  2. RÉSZ: WEB WORKER INJEKCIÓ
-//  A Worker automatikusan a fenti közös magot olvassa be magának. Nincs duplikáció!
+//  2. WEB WORKER INJEKCIÓ
 // ============================================================================
 
 let _worker = null;
@@ -283,10 +258,10 @@ let _pendingWorkerRequest = null;
 function _initWorker() {
   if (_worker) { _worker.terminate(); }
 
-  // Dinamikus Worker Script összerakása
   const workerString = `
     ${enemyPlayWeight.toString()}
-    ${_finalScore.toString()}
+    ${calculateFinalCoins.toString()}
+    ${compareCardEVs.toString()}
     ${_getCacheKey.toString()}
     ${mergeEquivalentHands.toString()}
     ${normalizeWeights.toString()}
@@ -354,9 +329,8 @@ function _requestEVComputation() {
   });
 }
 
-
 // ============================================================================
-//  3. RÉSZ: FŐSZÁL (UI, FALLBACK, HISTORY, ÁLLAPOT)
+//  3. FŐSZÁL (UI, FALLBACK, HISTORY, ÁLLAPOT)
 // ============================================================================
 
 const _mainCache = new Map();
@@ -534,7 +508,9 @@ function updateScoreBoard() {
   document.getElementById('scoreMine').textContent  = myScore;
   document.getElementById('scoreEnemy').textContent = enemyScore;
 
-  const diff   = myScore - enemyScore;
+  // [REF-1] Közös calculateFinalCoins hívás a Scoreboardon is
+  const diff = myScore - enemyScore;
+  const finalCoins = calculateFinalCoins(myScore, enemyScore);
   const diffEl = document.getElementById('scoreDiff');
 
   if (diff > 0) {
@@ -554,17 +530,17 @@ function updateScoreBoard() {
   const finalProj = document.getElementById('finalScoreProj');
   if (myCards.length === 0) {
     if (myScore > enemyScore) {
-      finalProj.innerHTML = `🏆 Játék vége! Győzelem! Végső pontszám: <strong style="color:var(--emerald-light);font-size:16px;">${myScore + diff}</strong>`;
+      finalProj.innerHTML = `🏆 Játék vége! Győzelem! Végső érme: <strong style="color:var(--emerald-light);font-size:16px;">${finalCoins}</strong>`;
     } else if (enemyScore > myScore) {
-      finalProj.innerHTML = `💀 Játék vége! Vereség.`;
+      finalProj.innerHTML = `💀 Játék vége! Vereség. Megszerzett érme: ${finalCoins}`;
     } else {
-      finalProj.innerHTML = `🤝 Játék vége! Döntetlen.`;
+      finalProj.innerHTML = `🤝 Játék vége! Döntetlen. Megszerzett érme: ${finalCoins}`;
     }
   } else {
     if (myScore > enemyScore) {
-      finalProj.innerHTML = `Ha most nyernél, a végső pontod: <strong style="color:var(--gold-light);font-size:15px;">${myScore + diff}</strong> lenne.`;
+      finalProj.innerHTML = `Ha most nyernél, a végső érme: <strong style="color:var(--gold-light);font-size:15px;">${finalCoins}</strong> lenne.`;
     } else {
-      finalProj.innerHTML = `Várható végeredmény: <span style="color:var(--text-dim)">Jelenleg nincs bónusz pont.</span>`;
+      finalProj.innerHTML = `Várható végeredmény: <span style="color:var(--text-dim)">Jelenleg nincs bónusz pont. (Alap: ${myScore})</span>`;
     }
   }
 }
