@@ -112,7 +112,9 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// [CLEAN] ecToHands most _parityOk-ot használja, nem saját logikát
+// [FIX] getAllCardEVs: minden lehetséges ellenfél kézre külön _computeEV hívás,
+// majd súlyozott átlag — így a rekurzió is a helyes (kézspecifikus) maszkkal dolgozik,
+// nem az összes lehetséges lap uniójával. Ez javítja az egyforma EV problémát.
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
   if (_lastEVList) return _lastEVList;
@@ -122,12 +124,14 @@ function getAllCardEVs() {
   const losePrefer = myScore < enemyScore;
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  const ecToHands = {};
+  // Minden (kéz, ellenfél lap) pár amit figyelembe veszünk
+  // Súly = 1 per pár, összesen = total
+  const pairs = [];
   for (const hand of possibleEnemyHands) {
+    const handMask = hand.reduce((m, c) => m | (1 << c), 0);
     for (const ec of hand.filter(ok)) {
-      if (!ecToHands[ec]) ecToHands[ec] = [];
-      const futureMask = hand.reduce((m, c) => m | (1 << c), 0) ^ (1 << ec);
-      ecToHands[ec].push(futureMask);
+      const futureMask = handMask ^ (1 << ec);
+      pairs.push({ ec, futureMask });
     }
   }
 
@@ -135,19 +139,17 @@ function getAllCardEVs() {
     const nextMyMask = nextMyBase ^ (1 << myCard);
     let totalEV = 0;
 
-    if (total === 0) {
+    if (pairs.length === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      for (const [ecStr, futureMasks] of Object.entries(ecToHands)) {
-        const ec = parseInt(ecStr);
+      // Minden (ec, futureMask) párra külön _computeEV — helyes kézspecifikus maszk
+      for (const { ec, futureMask } of pairs) {
         let nm = myScore, ne = enemyScore;
         if (myCard > ec) nm++; else if (myCard < ec) ne++;
-        for (const futureMask of futureMasks) {
-          const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
-          totalEV += subEV;
-        }
+        const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
+        totalEV += subEV;
       }
-      totalEV /= total;
+      totalEV /= pairs.length;
     }
 
     let w = 0, l = 0, d = 0;
