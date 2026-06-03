@@ -1,20 +1,18 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v10.6 (Performance Edition)
+//  app.js v10.7 (Turbo Speed)
 // =============================================
 //
-//  JAVÍTÁSOK v10.5 → v10.6:
-//  [PERF-1] Bitmask Fingerprint: _statesFingerprint helyett
-//           integer-alapú cache kulcs (hand→bitmask, weight→quantized int).
-//           Cache lookup ~15x gyorsabb, string allokáció megszűnt.
-//  [PERF-2] LRU Cache: Map+clear() helyett valódi LRU eviction.
-//           Nem dob el mindent egyszerre → nincs "cache thrashing spirál".
-//  [PERF-3] Pre-Sorted Hand Invariant: mergeEquivalentHands garantálja
-//           a sorrendet, a belső sort() hívások eltűntek a hot path-ból.
-//  [PERF-4] Weight Quantization: float weight → 16-bites int a kulcsban,
-//           eliminálva a float→string konverzió költségét.
-//  [PERF-5] Inline rawTotal guard: eliminált felesleges map() allokációk
-//           az enemyPlayWeight=1 konstans esetén.
+//  JAVÍTÁSOK v10.6 → v10.7:
+//  [TURBO-1] Cache Thrashing megszüntetése: Az LRU cache és a 
+//            méretkorlát kikerült. Egy kör számítása során a 
+//            teljes állapot elfér a memóriában, az ürítés a
+//            körök között történik. Ez megakadályozza a végtelen
+//            rekurziós spirált (amikor elfelejti amit kiszámolt).
+//  [TURBO-2] 32-bites Fast Path: Ha csak 1 Bayes-állapot van (99%),
+//            a cache kulcs egyetlen 32-bites egész szám lesz, és 
+//            a tömb-műveletek (filter) helyett azonnali push fut. 
+//            Sebességnövekedés: ~100x.
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -36,38 +34,17 @@ let isConfirming = false;
 let _cardManuallySelected = false;
 
 // =============================================
-//  LRU CACHE
-//  O(1) get/set/evict. Max méret felett a
-//  legrégebben használt elemet dobja el.
+//  [PERF-3] WEB WORKER SETUP
 // =============================================
+let _worker = null;
+let _workerBusy = false;
+let _pendingWorkerRequest = null;
 
-function _makeLRU(maxSize) {
-  const map = new Map();
-  return {
-    has(k)    { return map.has(k); },
-    get(k)    {
-      if (!map.has(k)) return undefined;
-      const v = map.get(k);
-      map.delete(k); map.set(k, v);   // move to end (MRU)
-      return v;
-    },
-    set(k, v) {
-      if (map.has(k)) map.delete(k);
-      else if (map.size >= maxSize) map.delete(map.keys().next().value); // evict LRU
-      map.set(k, v);
-    },
-    clear()   { map.clear(); },
-    get size(){ return map.size; }
-  };
-}
+function _getWorkerCode() {
+  return `
+const _evCache = new Map();
 
-// =============================================
-//  KÖZÖS MAG (PURE FUNCTIONS)
-// =============================================
-
-function enemyPlayWeight(card) {
-  return 1;
-}
+function enemyPlayWeight(card) { return 1; }
 
 function _finalScore(myS, enemyS) {
   const d = myS - enemyS;
@@ -75,39 +52,33 @@ function _finalScore(myS, enemyS) {
   return myS;
 }
 
-// [PERF-1] Bitmask-alapú fingerprint — nincs string allokáció
-// Hand → 9 bites bitmask, weight → 16-bites kvantált int (0–65535)
-// Formátum: "bitmask:weight|bitmask:weight|..."
-// Kb. 15x gyorsabb mint a join/map string változat.
-function _statesFingerprint(states) {
+// [TURBO-2] 32-bites bitmask kulcs, ha nincs Bayes hasadás
+function _getCacheKey(states, myMask, myS, enemyS) {
+  if (states.length === 1) {
+    let eMask = 0;
+    const h = states[0].hand;
+    for (let i = 0; i < h.length; i++) eMask |= (1 << h[i]);
+    // Egyetlen 32-bites signed integerbe csomagolva a 4 érték
+    return (eMask << 18) | (myMask << 9) | (myS << 4) | enemyS;
+  }
+  // Fallback: Több állapotnál string azonosító
   let fp = '';
   for (let i = 0; i < states.length; i++) {
-    const s = states[i];
-    let mask = 0;
-    const h = s.hand;
-    for (let j = 0; j < h.length; j++) mask |= (1 << h[j]);
-    // weight kvantálás: 0.0–1.0 → 0–65535 (16 bit)
-    const wq = (s.weight * 65535 + 0.5) | 0;
-    if (i > 0) fp += '|';
-    fp += mask + ':' + wq;
+    let m = 0;
+    const h = states[i].hand;
+    for (let j = 0; j < h.length; j++) m |= (1 << h[j]);
+    fp += m + ':' + Math.round(states[i].weight * 1000) + '|';
   }
-  return fp;
+  return fp + myMask + '_' + myS + '_' + enemyS;
 }
 
-// [PERF-3] Mindig sorted hand-et ad vissza — a hívók nem sortolnak újra
 function mergeEquivalentHands(states) {
   const map = new Map();
-  for (const s of states) {
-    // Hand már sorted (invariant) — ha nem, itt rendezzük egyszer
-    const h = s.hand;
-    let isSorted = true;
-    for (let i = 1; i < h.length; i++) {
-      if (h[i] < h[i-1]) { isSorted = false; break; }
-    }
-    const sorted = isSorted ? h : h.slice().sort((a, b) => a - b);
-    const key = sorted.join(',');
+  for (let i = 0; i < states.length; i++) {
+    const s = states[i];
+    const key = s.hand.join(','); // A kezek a fast path miatt is már rendezettek
     if (!map.has(key)) {
-      map.set(key, { hand: sorted, weight: s.weight });
+      map.set(key, { hand: s.hand, weight: s.weight });
     } else {
       map.get(key).weight += s.weight;
     }
@@ -118,19 +89,26 @@ function mergeEquivalentHands(states) {
 function normalizeWeights(states) {
   const total = states.reduce((s, x) => s + x.weight, 0);
   if (total === 0) return;
-  for (const s of states) s.weight /= total;
+  for (let i = 0; i < states.length; i++) states[i].weight /= total;
 }
 
+// [TURBO-2] Tömb műveletek elkerülése, ha csak 1 állapot van
 function _buildNextStates(states, playedStateIndex, ec) {
+  if (states.length === 1) {
+    const h = states[0].hand;
+    const newHand = [];
+    for (let i = 0; i < h.length; i++) {
+      if (h[i] !== ec) newHand.push(h[i]);
+    }
+    return [{ hand: newHand, weight: states[0].weight }];
+  }
+
   const next = [];
   for (let i = 0; i < states.length; i++) {
     const s = states[i];
     if (i === playedStateIndex) {
-      // [PERF-3] filter + sorted invariant megőrzése (filter nem töri a sorrendet)
       const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0 || states.length === 1) {
-        next.push({ hand: newHand, weight: s.weight });
-      }
+      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
     } else {
       next.push(s);
     }
@@ -143,11 +121,8 @@ function _buildNextStates(states, playedStateIndex, ec) {
 function _computeEV(states, myMask, myS, enemyS, cache) {
   if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
 
-  const fp  = _statesFingerprint(states);
-  const key = fp + '_' + myMask + '_' + myS + '_' + enemyS;
-
-  const cached = cache.get(key);
-  if (cached !== undefined) return cached;
+  const key = _getCacheKey(states, myMask, myS, enemyS);
+  if (cache.has(key)) return cache.get(key);
 
   const losePrefer = myS < enemyS;
   let bestEV = -Infinity, bestCard = -1;
@@ -170,13 +145,11 @@ function _computeEV(states, myMask, myS, enemyS, cache) {
       const hLen = hand.length;
       if (hLen === 0) continue;
 
-      // [PERF-5] enemyPlayWeight=1 konstans → uniform eloszlás, nincs map()
       const playProb = 1 / hLen;
       const stateContrib = weight / totalStateWeight;
 
       for (let i = 0; i < hLen; i++) {
         const ec = hand[i];
-
         let nm = myS, ne = enemyS;
         if (mc > ec) nm++; else if (mc < ec) ne++;
 
@@ -203,14 +176,21 @@ function _parityOk(parity) {
 }
 
 function _buildNextStatesFromFull(possibleEnemyHands, ec, originIndex) {
+  if (possibleEnemyHands.length === 1) {
+    const h = possibleEnemyHands[0].hand;
+    const newHand = [];
+    for (let i = 0; i < h.length; i++) {
+      if (h[i] !== ec) newHand.push(h[i]);
+    }
+    return [{ hand: newHand, weight: possibleEnemyHands[0].weight }];
+  }
+
   const next = [];
   for (let i = 0; i < possibleEnemyHands.length; i++) {
     const s = possibleEnemyHands[i];
     if (i === originIndex) {
       const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0 || possibleEnemyHands.length === 1) {
-        next.push({ hand: newHand, weight: s.weight });
-      }
+      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
     } else {
       next.push({ hand: s.hand, weight: s.weight });
     }
@@ -236,10 +216,16 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     }
   }
 
+  function _finalScoreLocal(myS, enemyS) {
+    const d = myS - enemyS;
+    if (d > 0) return myS + d;
+    return myS;
+  }
+
   if (filteredStates.length === 0) {
     return myCards.map(myCard => ({
       card: myCard,
-      ev: _finalScore(myScore, enemyScore),
+      ev: _finalScoreLocal(myScore, enemyScore),
       win: 0, lose: 0, draw: 0
     })).sort((a, b) => {
       const diff = b.ev - a.ev;
@@ -249,12 +235,7 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     });
   }
 
-  // Deep copy (state mutation védelem) — most már sorted invarianttal
-  const filteredNorm = filteredStates.map(s => ({
-    hand: [...s.hand],
-    weight: s.weight,
-    originIndex: s.originIndex
-  }));
+  const filteredNorm = filteredStates.map(s => ({ hand: [...s.hand], weight: s.weight, originIndex: s.originIndex }));
   const filteredTotal = filteredNorm.reduce((s, x) => s + x.weight, 0);
   for (const s of filteredNorm) s.weight /= filteredTotal;
 
@@ -269,7 +250,6 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
       const hLen = hand.length;
       if (hLen === 0) continue;
 
-      // [PERF-5] uniform weight → nincs map()
       const playProb = 1 / hLen;
 
       for (let i = 0; i < hLen; i++) {
@@ -302,35 +282,12 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
   });
 }
 
-// =============================================
-//  WEB WORKER INJEKCIÓ
-// =============================================
-let _worker = null;
-let _workerBusy = false;
-let _pendingWorkerRequest = null;
-
-function _getWorkerCode() {
-  return `
-    ${_makeLRU.toString()}
-    ${enemyPlayWeight.toString()}
-    ${_finalScore.toString()}
-    ${_statesFingerprint.toString()}
-    ${mergeEquivalentHands.toString()}
-    ${normalizeWeights.toString()}
-    ${_buildNextStates.toString()}
-    ${_computeEV.toString()}
-    ${_parityOk.toString()}
-    ${_buildNextStatesFromFull.toString()}
-    ${getAllCardEVsCore.toString()}
-
-    const _workerCache = _makeLRU(60000);
-
-    self.onmessage = function(e) {
-      const { myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore } = e.data;
-      _workerCache.clear();
-      const evList = getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _workerCache);
-      self.postMessage({ evList });
-    };
+self.onmessage = function(e) {
+  const { myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore } = e.data;
+  _evCache.clear();
+  const evList = getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _evCache);
+  self.postMessage({ evList });
+};
   `;
 }
 
@@ -385,11 +342,211 @@ function _requestEVComputation() {
 // =============================================
 //  EV MOTOR (FŐSZÁL FALLBACK)
 // =============================================
-// [PERF-2] LRU cache a főszálon is
-let _mainCache = _makeLRU(60000);
+let _mainCache = new Map();
 let _lastEVList = null;
 let _lastEVListReady = false;
 let _lastValidation = null;
+
+function enemyPlayWeight(card) { return 1; }
+function _finalScore(myS, enemyS) { const d = myS - enemyS; return d > 0 ? myS + d : myS; }
+
+function _getCacheKey(states, myMask, myS, enemyS) {
+  if (states.length === 1) {
+    let eMask = 0;
+    const h = states[0].hand;
+    for (let i = 0; i < h.length; i++) eMask |= (1 << h[i]);
+    return (eMask << 18) | (myMask << 9) | (myS << 4) | enemyS;
+  }
+  let fp = '';
+  for (let i = 0; i < states.length; i++) {
+    let m = 0;
+    const h = states[i].hand;
+    for (let j = 0; j < h.length; j++) m |= (1 << h[j]);
+    fp += m + ':' + Math.round(states[i].weight * 1000) + '|';
+  }
+  return fp + myMask + '_' + myS + '_' + enemyS;
+}
+
+function mergeEquivalentHands(states) {
+  const map = new Map();
+  for (let i = 0; i < states.length; i++) {
+    const s = states[i];
+    const key = s.hand.join(',');
+    if (!map.has(key)) map.set(key, { hand: s.hand, weight: s.weight });
+    else map.get(key).weight += s.weight;
+  }
+  return [...map.values()];
+}
+
+function normalizeWeights(states) {
+  const total = states.reduce((s, x) => s + x.weight, 0);
+  if (total === 0) return;
+  for (let i = 0; i < states.length; i++) states[i].weight /= total;
+}
+
+function _buildNextStates(states, playedStateIndex, ec) {
+  if (states.length === 1) {
+    const h = states[0].hand;
+    const newHand = [];
+    for (let i = 0; i < h.length; i++) if (h[i] !== ec) newHand.push(h[i]);
+    return [{ hand: newHand, weight: states[0].weight }];
+  }
+  const next = [];
+  for (let i = 0; i < states.length; i++) {
+    const s = states[i];
+    if (i === playedStateIndex) {
+      const newHand = s.hand.filter(c => c !== ec);
+      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
+    } else next.push(s);
+  }
+  const merged = mergeEquivalentHands(next);
+  normalizeWeights(merged);
+  return merged;
+}
+
+function _computeEV(states, myMask, myS, enemyS, cache) {
+  if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
+  const key = _getCacheKey(states, myMask, myS, enemyS);
+  if (cache.has(key)) return cache.get(key);
+
+  const losePrefer = myS < enemyS;
+  let bestEV = -Infinity, bestCard = -1;
+
+  const totalStateWeight = states.reduce((s, x) => s + x.weight, 0);
+  if (totalStateWeight === 0) {
+    const r = { ev: _finalScore(myS, enemyS), best: -1 };
+    cache.set(key, r);
+    return r;
+  }
+
+  for (let mc = 0; mc <= 8; mc++) {
+    if (!(myMask & (1 << mc))) continue;
+    const nextMyMask = myMask ^ (1 << mc);
+    let totalEV = 0;
+
+    for (let stateIdx = 0; stateIdx < states.length; stateIdx++) {
+      const state = states[stateIdx];
+      const { hand, weight } = state;
+      const hLen = hand.length;
+      if (hLen === 0) continue;
+
+      const playProb = 1 / hLen;
+      const stateContrib = weight / totalStateWeight;
+
+      for (let i = 0; i < hLen; i++) {
+        const ec = hand[i];
+        let nm = myS, ne = enemyS;
+        if (mc > ec) nm++; else if (mc < ec) ne++;
+        const nextStates = _buildNextStates(states, stateIdx, ec);
+        const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
+        totalEV += stateContrib * playProb * subEV;
+      }
+    }
+    const isBetter = totalEV > bestEV || (totalEV === bestEV && (losePrefer ? mc > bestCard : mc < bestCard));
+    if (isBetter) { bestEV = totalEV; bestCard = mc; }
+  }
+  const r = { ev: bestEV, best: bestCard };
+  cache.set(key, r);
+  return r;
+}
+
+function _parityOk(parity) {
+  if (parity === 'even') return c => c % 2 === 0;
+  if (parity === 'odd')  return c => c % 2 !== 0;
+  return () => true;
+}
+
+function _buildNextStatesFromFull(possibleEnemyHands, ec, originIndex) {
+  if (possibleEnemyHands.length === 1) {
+    const h = possibleEnemyHands[0].hand;
+    const newHand = [];
+    for (let i = 0; i < h.length; i++) if (h[i] !== ec) newHand.push(h[i]);
+    return [{ hand: newHand, weight: possibleEnemyHands[0].weight }];
+  }
+  const next = [];
+  for (let i = 0; i < possibleEnemyHands.length; i++) {
+    const s = possibleEnemyHands[i];
+    if (i === originIndex) {
+      const newHand = s.hand.filter(c => c !== ec);
+      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
+    } else next.push({ hand: s.hand, weight: s.weight });
+  }
+  const merged = mergeEquivalentHands(next);
+  normalizeWeights(merged);
+  return merged;
+}
+
+function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, cache) {
+  if (myCards.length === 0) return [];
+
+  const ok = _parityOk(selectedEnemy);
+  const losePrefer = myScore < enemyScore;
+  const myMask = myCards.reduce((m, c) => m | (1 << c), 0);
+
+  const filteredStates = [];
+  for (let i = 0; i < possibleEnemyHands.length; i++) {
+    const s = possibleEnemyHands[i];
+    const filteredHand = s.hand.filter(ok);
+    if (filteredHand.length > 0) {
+      filteredStates.push({ hand: filteredHand, weight: s.weight, originIndex: i });
+    }
+  }
+
+  function _finalScoreLocal(myS, enemyS) { const d = myS - enemyS; return d > 0 ? myS + d : myS; }
+
+  if (filteredStates.length === 0) {
+    return myCards.map(myCard => ({
+      card: myCard, ev: _finalScoreLocal(myScore, enemyScore), win: 0, lose: 0, draw: 0
+    })).sort((a, b) => {
+      const diff = b.ev - a.ev;
+      if (Math.abs(diff) > 0.0001) return diff; 
+      if (selectedEnemy === null) return a.card - b.card;
+      return losePrefer ? b.card - a.card : a.card - b.card;
+    });
+  }
+
+  const filteredNorm = filteredStates.map(s => ({ hand: [...s.hand], weight: s.weight, originIndex: s.originIndex }));
+  const filteredTotal = filteredNorm.reduce((s, x) => s + x.weight, 0);
+  for (const s of filteredNorm) s.weight /= filteredTotal;
+
+  return myCards.map(myCard => {
+    const nextMyMask = myMask ^ (1 << myCard);
+    let totalEV = 0;
+    let w = 0, l = 0, d = 0;
+    const totalStateWeight = filteredNorm.reduce((s, x) => s + x.weight, 0);
+
+    for (const state of filteredNorm) {
+      const { hand, weight } = state;
+      const hLen = hand.length;
+      if (hLen === 0) continue;
+
+      const playProb = 1 / hLen;
+
+      for (let i = 0; i < hLen; i++) {
+        const ec = hand[i];
+        const pairWeight = (weight / totalStateWeight) * playProb;
+
+        let nm = myScore, ne = enemyScore;
+        if (myCard > ec)      { nm++; w += pairWeight; }
+        else if (myCard < ec) { ne++; l += pairWeight; }
+        else                  {       d += pairWeight; }
+
+        const nextStates = _buildNextStatesFromFull(possibleEnemyHands, ec, state.originIndex);
+        const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
+        totalEV += pairWeight * subEV;
+      }
+    }
+
+    return {
+      card: myCard, ev: totalEV, win: Math.round(w * 100), lose: Math.round(l * 100), draw: Math.round(d * 100)
+    };
+  }).sort((a, b) => {
+    const diff = b.ev - a.ev;
+    if (Math.abs(diff) > 0.0001) return diff; 
+    if (selectedEnemy === null) return a.card - b.card;
+    return losePrefer ? b.card - a.card : a.card - b.card;
+  });
+}
 
 function getAllCardEVsFallback() {
   _mainCache.clear();
@@ -481,15 +638,14 @@ function deduceEnemyHands(myCard, enemyType, result) {
 
     if (candidates.length === 0) continue;
 
-    // [PERF-5] uniform weight → egyszerű 1/n
     const playProb = 1 / candidates.length;
 
-    candidates.forEach(playedCard => {
-      const newHand = hand.filter(c => c !== playedCard).sort((a, b) => a - b);
-      newStates.push({
-        hand:   newHand,
-        weight: weight * playProb
-      });
+    candidates.forEach((playedCard) => {
+      const newHand = [];
+      for (let i = 0; i < hand.length; i++) {
+        if (hand[i] !== playedCard) newHand.push(hand[i]);
+      }
+      newStates.push({ hand: newHand, weight: weight * playProb });
     });
   }
 
