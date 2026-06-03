@@ -1,21 +1,18 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v7.0
+//  app.js v8.0
 // =============================================
 //
-//  JAVÍTÁSOK v6.0 → v7.0:
-//  [PERF1] _evCache.clear() áthelyezve confirmRound()-ba — nem minden getAllCardEVs()-be
-//  [PERF2] getAllCardEVs() eredménye cachelve körön belül (_lastEVList),
-//          renderMyCards + renderOracle + autoSelect mind ebből olvas
-//  [PERF3] _validateResult() eredménye cachelve (_lastValidation), nem számolja újra
-//  [BUG6]  ecToHands súlyozás javítva: (handEVSum/len)*len = handEVSum volt, weight elveszett
-//  [BUG7]  selectMyCard() frissíti az eredmény-gombok tiltott állapotát is
-//  [UX2]   Eredmény-gombok (Win/Lose/Draw) csak akkor kattinthatók ha az adott
-//          eredmény lehetséges a jelenlegi saját lap + ellenfél paritás alapján
-//          — hibaüzenet helyett a gomb el van szürkítve
-//  [UX3]   Páros/Páratlan gombok mindig engedélyezve — ha mi kezdünk, a paritást
-//          a kör UTÁN látjuk az ellenfél kezéből (melyik szín fogyott), ezért
-//          a rögzítés előtt bármikor megadható
+//  JAVÍTÁSOK v7.0 → v8.0:
+//  [BUG8]  deduceEnemyHands: .sort() visszarakva — nélküle azonos kezek
+//          különböző stringként duplikálódtak a Set-ben, torzítva a dedukciót
+//  [BUG9]  updateConfirmBtn hint sorrend javítva: iStarted módban előbb
+//          kérje a paritást, utána a lapot (fordított sorrend volt)
+//  [BUG10] _finalScore: döntetlen esetén 0 helyett myS-t ad vissza,
+//          mivel a játékban döntetlen esetén az alappont jár, nem 0
+//          (ha a játék másként pontozza, itt kell módosítani)
+//  [CLEAN] getAllCardEVs: ecToHands építés és _getWeightedCards duplikált
+//          parityOk logikája összevonva — egyetlen forrás
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -34,22 +31,29 @@ let iStarted       = false;
 let history  = [];
 let roundNum = 0;
 let isConfirming = false;
-let _cardManuallySelected = false; // true ha a user kézzel választott lapot (nem autoselect)
+let _cardManuallySelected = false;
 
 // =============================================
 //  EV MOTOR
 // =============================================
 let _evCache = new Map();
-let _lastEVList = null;          // [PERF2] kör-szintű EV cache
-let _lastValidation = null;      // [PERF3] validáció cache
+let _lastEVList = null;
+let _lastValidation = null;
 
 function _maskCount(m) {
   let n = 0; while (m) { n += m & 1; m >>= 1; } return n;
 }
 
+// Meccs végi pontszám számítása:
+// - Győzelem (d > 0): alappont + különbség bónusz (pl. 4-3 → 5)
+// - Döntetlen (d = 0): alappont jár (pl. 4-4 → 4)
+// - Vereség (d < 0): alappont jár, bónusz nincs (pl. 3-5 → 3)
+// Döntetlen és vereség ugyanannyi pontot ér az EV motor szempontjából,
+// ezért az oracle nem erőlteti feleslegesen a döntetlent veszítő állásban.
 function _finalScore(myS, enemyS) {
   const d = myS - enemyS;
-  return d > 0 ? myS + d : 0;
+  if (d > 0) return myS + d;
+  return myS; // döntetlen és vereség: csak az alappont jár
 }
 
 function _computeEV(myMask, enemyMask, myS, enemyS) {
@@ -89,13 +93,18 @@ function _computeEV(myMask, enemyMask, myS, enemyS) {
   return r;
 }
 
+// [CLEAN] Egységes parityOk segédfüggvény — egyetlen forrás mindenhol
+function _parityOk(parity) {
+  if (parity === 'even') return c => c % 2 === 0;
+  if (parity === 'odd')  return c => c % 2 !== 0;
+  return () => true;
+}
+
 function _getWeightedCards(parity) {
-  const parityOk = parity === 'even' ? (c => c % 2 === 0)
-                 : parity === 'odd'  ? (c => c % 2 !== 0)
-                 : (c => true);
+  const ok = _parityOk(parity);
   let cardCounts = {}, total = 0;
   for (const hand of possibleEnemyHands) {
-    for (const c of hand.filter(parityOk)) {
+    for (const c of hand.filter(ok)) {
       cardCounts[c] = (cardCounts[c] || 0) + 1;
       total++;
     }
@@ -103,28 +112,19 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// [PERF2] Kör-szintű EV cache: csak akkor számol újra, ha az input változott
-// [BUG6]  Súlyozás javítva: minden (ec, hand) párhoz 1 szavazat,
-//         az átlagolás a total (összes szavazat) alapján történik
+// [CLEAN] ecToHands most _parityOk-ot használja, nem saját logikát
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
-
-  // [PERF2] Ha semmi nem változott, visszaadjuk a cached listát
   if (_lastEVList) return _lastEVList;
 
+  const ok = _parityOk(selectedEnemy);
   const { cardCounts, total } = _getWeightedCards(selectedEnemy);
   const losePrefer = myScore < enemyScore;
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0)
-                 : selectedEnemy === 'odd'  ? (c => c % 2 !== 0)
-                 : (c => true);
-
-  // [BUG6 FIX] ecToHands: minden (ec, hand) párt külön tárolunk
-  // Súly = 1 per (ec, hand) pár, az összes szavazat = total
   const ecToHands = {};
   for (const hand of possibleEnemyHands) {
-    for (const ec of hand.filter(parityOk)) {
+    for (const ec of hand.filter(ok)) {
       if (!ecToHands[ec]) ecToHands[ec] = [];
       const futureMask = hand.reduce((m, c) => m | (1 << c), 0) ^ (1 << ec);
       ecToHands[ec].push(futureMask);
@@ -138,12 +138,10 @@ function getAllCardEVs() {
     if (total === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      // [BUG6 FIX] Minden (ec, futureMask) pár egyenlő súlyú (1/total)
       for (const [ecStr, futureMasks] of Object.entries(ecToHands)) {
         const ec = parseInt(ecStr);
         let nm = myScore, ne = enemyScore;
         if (myCard > ec) nm++; else if (myCard < ec) ne++;
-
         for (const futureMask of futureMasks) {
           const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
           totalEV += subEV;
@@ -172,7 +170,6 @@ function getAllCardEVs() {
   return _lastEVList;
 }
 
-// [PERF2] EV lista invalidálása: hívd minden állapotváltozáskor
 function _invalidateEVCache() {
   _lastEVList = null;
   _lastValidation = null;
@@ -184,19 +181,15 @@ function getBestCard() {
 }
 
 // =============================================
-//  VALIDÁCIÓ — CACHELVE
-//  [PERF3] Csak akkor számol újra, ha input változott
-//  [UX2]   Visszaadja melyik eredmény-gombok engedélyezhetők
+//  VALIDÁCIÓ
 // =============================================
 function _getResultAvailability() {
-  // Cache key: mi függ tőle
   const key = `${selectedMine}|${selectedEnemy}`;
   if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
 
   const availability = { win: true, lose: true, draw: true };
 
   if (selectedMine === null || selectedEnemy === null) {
-    // Ha nincs lap vagy paritás: minden tiltott
     availability.win = false;
     availability.lose = false;
     availability.draw = false;
@@ -204,21 +197,19 @@ function _getResultAvailability() {
     return availability;
   }
 
-  const parityOk = selectedEnemy === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+  const ok = _parityOk(selectedEnemy);
 
-  // Döntetlen: csak ha a saját lap paritása egyezik az ellenfél paritásával
-  // (különben nem lehet azonos a két lap értéke)
-  if (!parityOk(selectedMine)) {
+  // Döntetlen csak ha a saját lap paritása egyezik az ellenfél paritásával
+  if (!ok(selectedMine)) {
     availability.draw = false;
   }
 
-  // Minden eredményt ellenőrzünk a possibleEnemyHands alapján
   for (const res of ['win', 'lose', 'draw']) {
-    if (!availability[res]) continue; // már kizárva paritás alapján
+    if (!availability[res]) continue;
     let found = false;
     for (const hand of possibleEnemyHands) {
-      let candidates = hand.filter(c => parityOk(c));
-      if (res === 'win')  candidates = candidates.filter(c => c < selectedMine);
+      let candidates = hand.filter(c => ok(c));
+      if (res === 'win')       candidates = candidates.filter(c => c < selectedMine);
       else if (res === 'lose') candidates = candidates.filter(c => c > selectedMine);
       else if (res === 'draw') candidates = candidates.filter(c => c === selectedMine);
       if (candidates.length > 0) { found = true; break; }
@@ -235,7 +226,7 @@ function _getResultAvailability() {
 // =============================================
 function autoSelectOracleCard() {
   selectedMine = getBestCard();
-  _cardManuallySelected = false; // autoselect → nem manuális
+  _cardManuallySelected = false;
 }
 
 // =============================================
@@ -264,17 +255,14 @@ function init() {
 }
 
 // =============================================
-//  UI FRISSÍTÉS — EGYSÉGES BELÉPÉSI PONT
-//  [PERF2] Egyszer invalidál, majd minden renderelő
-//          funkció az ugyanazon _lastEVList-ből olvas
+//  UI FRISSÍTÉS
 // =============================================
 function _refreshUI() {
-  // EV lista egyszer számolódik, mind a három render ebből olvas
   renderMyCards();
   renderEnemyCards();
   renderOracle();
-  updateResultButtons(); // [UX2]
-  updatePairityButtons(); // [UX3]
+  updateResultButtons();
+  updatePairityButtons();
   updateConfirmBtn();
   updateChips();
 }
@@ -322,9 +310,7 @@ function updateScoreBoard() {
 }
 
 // =============================================
-//  [UX2] EREDMÉNY-GOMBOK TILTÁSA
-//  Win/Lose/Draw csak akkor kattintható, ha az
-//  adott eredmény lehetséges a jelenlegi állapotban
+//  EREDMÉNY-GOMBOK
 // =============================================
 function updateResultButtons() {
   const av = _getResultAvailability();
@@ -337,7 +323,6 @@ function updateResultButtons() {
   btnLose.disabled = !av.lose;
   btnDraw.disabled = !av.draw;
 
-  // Ha a kijelölt eredmény érvénytelenné vált (pl. lapot váltottunk)
   if (selectedResult && !av[selectedResult]) {
     selectedResult = null;
     btnWin.classList.remove('active');
@@ -346,19 +331,13 @@ function updateResultButtons() {
   }
 }
 
-// =============================================
-//  PARITÁS-GOMBOK — mindig kattinthatók
-//  Ha ellenfél kezd: a kör előtt látjuk a hátlapot → adjuk meg előre
-//  Ha mi kezdünk: a kör UTÁN látjuk az ellenfél kezéből melyik paritás fogyott
-//  → mindkét esetben a rögzítés előtt kell megadni, mindig engedélyezett
-// =============================================
 function updatePairityButtons() {
   document.getElementById('btnEven').disabled = false;
   document.getElementById('btnOdd').disabled  = false;
 }
 
 // =============================================
-//  RENDER — SAJÁT LAPOK (EV badge-ekkel)
+//  RENDER — SAJÁT LAPOK
 // =============================================
 function renderMyCards() {
   const container = document.getElementById('myCardsRow');
@@ -367,7 +346,6 @@ function renderMyCards() {
   const oddRow  = document.createElement('div'); oddRow.className  = 'cards-sub-row';
   const evenRow = document.createElement('div'); evenRow.className = 'cards-sub-row';
 
-  // [PERF2] getAllCardEVs() itt nem számol újra, a _lastEVList-ből ad vissza
   const evList = getAllCardEVs();
   const evMap  = {};
   evList.forEach(x => { evMap[x.card] = x; });
@@ -442,7 +420,7 @@ function renderEnemyCards() {
     if (possible) {
       const chanceDiv = document.createElement('div');
       chanceDiv.className = 'enemy-chance';
-      if (chance === 100)  chanceDiv.classList.add('sure-chance');
+      if (chance === 100)    chanceDiv.classList.add('sure-chance');
       else if (chance >= 70) chanceDiv.classList.add('high-chance');
       else if (chance <= 30) chanceDiv.classList.add('low-chance');
       chanceDiv.textContent = chance + '%';
@@ -492,7 +470,6 @@ function renderOracle() {
     return;
   }
 
-  // [PERF2] Nem hív getAllCardEVs()-t újra, _lastEVList már megvan renderMyCards() után
   const evList = getAllCardEVs();
   if (evList.length === 0) return;
 
@@ -594,13 +571,12 @@ function renderOracle() {
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
   if (selectedMine === n) {
-    // toggle: visszakapcsolás autoselectre
     _cardManuallySelected = false;
     _invalidateEVCache();
     autoSelectOracleCard();
   } else {
     selectedMine = n;
-    _cardManuallySelected = true; // manuális választás
+    _cardManuallySelected = true;
     _invalidateEVCache();
   }
   _refreshUI();
@@ -611,10 +587,6 @@ function selectEnemyType(type) {
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
-  // Paritásváltáskor mindig újraszámoljuk az EV-t.
-  // Ha MI KEZDTÜK a kört: a lapot vakon választottuk ELŐRE → paritás utólagos info,
-  //   ne bántsuk a kijelölt lapot (se manuálisnál, se autoselectnél).
-  // Ha ELLENFÉL KEZDTE: a paritás előzetes info → ha nem manuális, az oracle frissít.
   _invalidateEVCache();
   if (!iStarted && !_cardManuallySelected) {
     autoSelectOracleCard();
@@ -624,9 +596,8 @@ function selectEnemyType(type) {
 }
 
 function selectResult(res) {
-  // [UX2] Csak engedélyezett eredményt fogadunk el
   const av = _getResultAvailability();
-  if (!av[res]) return; // tiltott gomb — nem csinálunk semmit
+  if (!av[res]) return;
 
   selectedResult = (selectedResult === res) ? null : res;
   document.getElementById('btnWin').classList.toggle('active',  selectedResult === 'win');
@@ -664,6 +635,7 @@ function updateChips() {
   }
 }
 
+// [BUG9] Javított hint sorrend: iStarted módban előbb paritást kér, utána lapot
 function updateConfirmBtn() {
   const btn  = document.getElementById('btnConfirm');
   const hint = document.getElementById('confirmHint');
@@ -681,11 +653,16 @@ function updateConfirmBtn() {
   if (!hint) return;
 
   if (!iStarted && selectedEnemy === null) {
+    // Ellenfél kezdett: előbb paritást kell megadni, majd a lap és eredmény
     hint.textContent = '⬛⬜ Nézd meg az ellenfél hátlapját, kattints Páros/Páratlan!';
+  } else if (iStarted && selectedMine === null) {
+    // Te kezdtél: előbb az oracle alapján válaszd ki a lapot
+    hint.textContent = '🃏 Nézd meg az Oracle javaslatát, válaszd ki a lapot!';
+  } else if (selectedEnemy === null) {
+    // Te kezdtél és leraktad a lapot: most add meg az ellenfél paritását
+    hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását!';
   } else if (selectedMine === null) {
     hint.textContent = '🃏 Válaszd ki a javasolt lapot (vagy más lapot)!';
-  } else if (iStarted && selectedEnemy === null) {
-    hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását!';
   } else if (!selectedResult) {
     hint.textContent = '🎯 Add meg a kör eredményét!';
   } else if (canConfirm) {
@@ -698,18 +675,21 @@ function updateConfirmBtn() {
 // =============================================
 //  DEDUKCIÓS LOGIKA
 // =============================================
+// [BUG8] .sort() visszarakva — nélküle azonos kezek különböző stringként
+//        duplikálódhattak a Set-ben, ami torzította az ellenfél valószínűségeit
 function deduceEnemyHands(myCard, enemyType, result) {
-  const parityOk = enemyType === 'even' ? (c => c % 2 === 0) : (c => c % 2 !== 0);
+  const ok = _parityOk(enemyType);
   let newHandsSet = new Set();
 
   for (const hand of possibleEnemyHands) {
-    let candidates = hand.filter(c => parityOk(c));
+    let candidates = hand.filter(c => ok(c));
     if (result === 'win')       candidates = candidates.filter(c => c < myCard);
     else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
     else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
 
     for (const c of candidates) {
-      newHandsSet.add(hand.filter(card => card !== c).join(','));
+      // [BUG8] .sort() biztosítja hogy ugyanaz a kéz mindig ugyanaz a string legyen
+      newHandsSet.add(hand.filter(card => card !== c).sort((a, b) => a - b).join(','));
     }
   }
 
@@ -717,7 +697,6 @@ function deduceEnemyHands(myCard, enemyType, result) {
     str === '' ? [] : str.split(',').map(Number)
   );
 
-  // Ha üres: az [UX2] elvileg megakadályozza ezt, de biztonság kedvéért
   return newHands.length > 0 ? newHands : possibleEnemyHands;
 }
 
@@ -759,7 +738,6 @@ function confirmRound() {
 
   clearActionButtons();
 
-  // [PERF1] EV cache törlése csak itt, körváltáskor
   _evCache.clear();
   _invalidateEVCache();
 
@@ -808,6 +786,10 @@ function undoLast() {
   myScore            = snap.myScore;
   enemyScore         = snap.enemyScore;
   roundNum           = snap.roundNum;
+
+  iStarted = snap.iStarted;
+  const chkUndo = document.getElementById('chkIStart');
+  if (chkUndo) chkUndo.checked = iStarted;
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
   _cardManuallySelected = false;
