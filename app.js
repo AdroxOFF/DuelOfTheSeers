@@ -731,6 +731,13 @@ function confirmRound() {
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
 
+  // Az első kör után letiltjuk az iStarted checkboxot —
+  // ki kezd az egész meccsen ugyanaz, nem kell/szabad körönként változtatni
+  if (roundNum === 1) {
+    const chk = document.getElementById('chkIStart');
+    if (chk) chk.disabled = true;
+  }
+
   selectedMine = null;
   selectedResult = null;
   selectedEnemy = null;
@@ -814,7 +821,7 @@ function resetAll() {
   _cardManuallySelected = false;
 
   const chk = document.getElementById('chkIStart');
-  if (chk) chk.checked = false;
+  if (chk) { chk.checked = false; chk.disabled = false; }
   iStarted = false;
 
   clearActionButtons();
