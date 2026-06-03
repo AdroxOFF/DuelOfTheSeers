@@ -1,35 +1,28 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v10.0
+//  app.js v10.1 (bugfix)
 // =============================================
 //
-//  JAVÍTÁSOK v9.2 → v10.0:
-//  [EXACT1] _computeEV mostantól states:[{hand,weight}] listán fut,
-//           nem összevont enemyMask bitmaskre. Ez azt jelenti, hogy
-//           a Bayes-állapotok végig megmaradnak a teljes jövőfában —
-//           az EV számítás pontosan figyelembe veszi, hogy az ellenfél
-//           kezéből mely lapok estek már ki melyik állapotvonalban.
-//           Korábban a _computeEV egy átlagolt maskre váltott vissza,
-//           elveszítve az állapot-specifikus kézkészlet-információt.
-//  [EXACT2] Cache kulcs: states "hand|weight" fingerprint alapján épül,
-//           így különböző állapoteloszlások soha nem ütköznek egymással.
-//  [EXACT3] getAllCardEVs: a pairs lista eltűnt — a számítás közvetlenül
-//           _computeEV(states, ...) hívásra épül. A win/lose/draw
-//           statisztikák is állapotonként súlyozottan gyűlnek.
-//  [EXACT4] Teljesítmény-megjegyzés: a states lista méretével az EV-fa
-//           lineárisan skálázódik (states.length × 9 × 8 × ... helyett
-//           az összevonás miatt a practice-ban kezelhető marad).
-//           Nagyon széles eloszlásnál (>200 kombináció) lassulhat —
-//           de a 9 lapos játékban ez ritkán lép fel.
-//
-//  Korábbi javítások (v8.0–v9.2) változatlanok maradnak:
-//  [FIX1–4] [BAY1–5] [HOOK] — ld. korábbi changelog.
+//  JAVÍTÁSOK v10.0 → v10.1:
+//  [FIX-FULL1] _buildNextStatesFromFull: a playedStateRef azonosítása
+//              mostantól index alapján történik (filteredToFullIndex map),
+//              nem _handsOverlap() tartalom-összehasonlítással.
+//              Ez megakadályozza, hogy több hasonló struktúrájú állapotból
+//              is kivegye az ec lapot, amikor csak egyikből kellene.
+//  [FIX-FULL2] getAllCardEVs: a filteredNorm építésekor minden szűrt
+//              állapothoz eltároljuk az eredeti possibleEnemyHands-beli
+//              indexét (originIndex). Így _buildNextStatesFromFull
+//              pontosan tudja, melyik teljes állapotot kell módosítani.
+//  [FIX-FULL3] _handsOverlap eltávolítva — már nem szükséges, a
+//              index-alapú azonosítás felváltotta.
+//  [FIX-CACHE] _evCache.clear() mostantól confirmRound() elején is
+//              megtörténik (a setTimeout előtt), hogy ne maradjon
+//              elavult cache a rögzítés és az autoSelect között.
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 let myCards            = [...ALL_CARDS];
-
 // [BAY1] Súlyozott állapotok: {hand: number[], weight: number}
 let possibleEnemyHands = [ { hand: [...ALL_CARDS], weight: 1 } ];
 
@@ -47,14 +40,14 @@ let isConfirming = false;
 let _cardManuallySelected = false;
 
 // =============================================
-//  [HOOK] ELLENFÉL PRIOR — egyetlen helyen módosítandó
+//  [HOOK] ELLENFÉL PRIOR
 // =============================================
 function enemyPlayWeight(card) {
-  return 1; // egyenletes prior — módosítsd ha ellenfél-modellt szeretnél
+  return 1;
 }
 
 // =============================================
-//  EV MOTOR — [EXACT1] states alapú rekurzió
+//  EV MOTOR
 // =============================================
 let _evCache = new Map();
 let _lastEVList = null;
@@ -70,24 +63,13 @@ function _finalScore(myS, enemyS) {
   return myS;
 }
 
-// [EXACT2] Cache kulcs states fingerprint alapján
 function _statesFingerprint(states) {
-  // Gyors fingerprint: minden állapot "hand:weight" összefűzve
-  // A hand már rendezett (deduceEnemyHands biztosítja)
   return states.map(s => s.hand.join(',') + ':' + s.weight.toFixed(6)).join('|');
 }
 
-// [EXACT1] _computeEV mostantól states:[{hand,weight}] listán fut.
-// Minden rekurzív hívás az aktuális állapoteloszlást propagálja tovább,
-// nem vált vissza összevont maskre.
-//
-// states: [{hand: number[], weight: number}] — normalizált súlyok
-// myMask: a saját megmaradt lapok bitmaskje
-// myS, enemyS: aktuális pontállás
 function _computeEV(states, myMask, myS, enemyS) {
   if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
 
-  // [EXACT2] Cache: állapot fingerprint + saját lapok + pontállás
   const fp  = _statesFingerprint(states);
   const key = `${fp}||${myMask},${myS},${enemyS}`;
   if (_evCache.has(key)) return _evCache.get(key);
@@ -95,8 +77,6 @@ function _computeEV(states, myMask, myS, enemyS) {
   const losePrefer = myS < enemyS;
   let bestEV = -Infinity, bestCard = -1;
 
-  // Teljes súly az ellenfél oldalán (normalizált states esetén = 1,
-  // de biztonság kedvéért újra összegzünk)
   const totalStateWeight = states.reduce((s, x) => s + x.weight, 0);
   if (totalStateWeight === 0) {
     const r = { ev: _finalScore(myS, enemyS), best: -1 };
@@ -109,12 +89,10 @@ function _computeEV(states, myMask, myS, enemyS) {
     const nextMyMask = myMask ^ (1 << mc);
     let totalEV = 0;
 
-    // Minden Bayes-állapotban az ellenfél lehetséges lapjai
     for (const state of states) {
       const { hand, weight } = state;
       if (hand.length === 0) continue;
 
-      // Prior-súlyozott jelöltek az egyes állapotban
       const rawWeights = hand.map(c => enemyPlayWeight(c));
       const rawTotal   = rawWeights.reduce((s, w) => s + w, 0);
       if (rawTotal === 0) continue;
@@ -126,15 +104,8 @@ function _computeEV(states, myMask, myS, enemyS) {
         let nm = myS, ne = enemyS;
         if (mc > ec) nm++; else if (mc < ec) ne++;
 
-        // [EXACT1] Rekurzív hívás: az ec lap kiesésével frissített states lista
-        // Az adott állapotból az ec kivételével marad a kéz;
-        // a többi állapot változatlan, de az ec-t kijátszó állapot
-        // új kézzel szerepel.
         const nextStates = _buildNextStates(states, state, ec);
-
         const subEV = _computeEV(nextStates, nextMyMask, nm, ne).ev;
-        // Kombinált súly: state.weight (Bayes prior) × playProb (prior hook)
-        // osztva totalStateWeight-tel hogy normált maradjon
         totalEV += (weight / totalStateWeight) * playProb * subEV;
       }
     }
@@ -149,25 +120,18 @@ function _computeEV(states, myMask, myS, enemyS) {
   return r;
 }
 
-// [EXACT1] Segédfüggvény: az states listából kiveszi az ec lapot
-// a megadott állapotból, és az összes többi állapotot változatlanul hagyja.
-// Az eredmény újra normalizált állapotlista lesz.
 function _buildNextStates(states, playedState, ec) {
   const next = [];
   for (const s of states) {
     if (s === playedState) {
-      // Ebből az állapotból kiesik az ec lap
       const newHand = s.hand.filter(c => c !== ec);
       if (newHand.length > 0 || states.length === 1) {
         next.push({ hand: newHand, weight: s.weight });
       }
-      // Ha a kéz teljesen kiürül és vannak más állapotok, az állapot megszűnik.
-      // (Ez elvileg csak a játék vége felé fordulhat elő.)
     } else {
       next.push(s);
     }
   }
-  // Összevonás és normalizálás [BAY3] szerint
   const merged = mergeEquivalentHands(next);
   normalizeWeights(merged);
   return merged;
@@ -179,7 +143,6 @@ function _parityOk(parity) {
   return () => true;
 }
 
-// [BAY4] weight-tel súlyoz darabszám helyett
 function _getWeightedCards(parity) {
   const ok = _parityOk(parity);
   let cardCounts = {}, total = 0;
@@ -193,9 +156,12 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// [EXACT3] getAllCardEVs: közvetlenül _computeEV(states, ...) hívásra épül.
-// A win/lose/draw statisztikák az első szint alapján számolódnak
-// (az első körös kimenetel valószínűsége × súly), a jövőfa az EV-n belül.
+// =============================================
+//  [FIX-FULL1][FIX-FULL2] getAllCardEVs
+//  A filteredNorm mostantól originIndex-et tárol,
+//  hogy _buildNextStatesFromFull pontosan azonosítsa
+//  a megfelelő teljes állapotot.
+// =============================================
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
   if (_lastEVList) return _lastEVList;
@@ -204,13 +170,16 @@ function getAllCardEVs() {
   const losePrefer = myScore < enemyScore;
   const myMask = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  // Paritás-szűrt states: csak azok az állapotok/lapok jönnek szóba,
-  // amelyekben az ellenfélnek van a paritásnak megfelelő lapja
-  const filteredStates = possibleEnemyHands
-    .map(s => ({ hand: s.hand.filter(ok), weight: s.weight }))
-    .filter(s => s.hand.length > 0);
+  // [FIX-FULL2] originIndex: az eredeti possibleEnemyHands-beli pozíció
+  const filteredStates = [];
+  for (let i = 0; i < possibleEnemyHands.length; i++) {
+    const s = possibleEnemyHands[i];
+    const filteredHand = s.hand.filter(ok);
+    if (filteredHand.length > 0) {
+      filteredStates.push({ hand: filteredHand, weight: s.weight, originIndex: i });
+    }
+  }
 
-  // Ha nincs szűrt állapot (pl. az ellenfél minden lapja kiesett), fallback
   if (filteredStates.length === 0) {
     _lastEVList = myCards.map(myCard => ({
       card: myCard,
@@ -220,18 +189,10 @@ function getAllCardEVs() {
     return _lastEVList;
   }
 
-  // Normalizálás a szűrt states-re
+  // Normalizálás (originIndex megőrzésével)
   const filteredNorm = filteredStates.map(s => ({ ...s }));
-  normalizeWeights(filteredNorm);
-
-  // Teljes states (paritás nélkül) az EV rekurzióhoz, de szűrve a paritásra
-  // az első körben. A jövőfa az összes megmaradó lapot figyelembe veszi.
-  // Ehhez az eredeti possibleEnemyHands kell, de az első lépés szűrt.
-  //
-  // Technikai megjegyzés: a filteredNorm-t adjuk _computeEV-nek,
-  // de a _buildNextStates-ben a jövőbeli körökben már az EC kiesése után
-  // az összes lap (páros+páratlan együtt) megmarad — így a jövőfa
-  // nem ragad bele a paritás-szűrőbe.
+  const filteredTotal = filteredNorm.reduce((s, x) => s + x.weight, 0);
+  for (const s of filteredNorm) s.weight /= filteredTotal;
 
   _lastEVList = myCards.map(myCard => {
     const nextMyMask = myMask ^ (1 << myCard);
@@ -255,15 +216,8 @@ function getAllCardEVs() {
         else if (myCard < ec) { ne++; l += pairWeight; }
         else                  {       d += pairWeight; }
 
-        // [EXACT1] A jövőfa a szűrt állapotból indul, az ec kiesésével
-        // Az itt kapott nextStates a következő körre vonatkozik,
-        // ahol már nincs paritás-szűrő — az összes megmaradó lapot látjuk.
-        // Ezért a _computeEV belső szintjein filteredNorm helyett
-        // a full állapotot (paritás nélkül) kellene használni.
-        //
-        // Megoldás: a _buildNextStates az eredeti possibleEnemyHands-ból
-        // épít, nem a filteredNorm-ból, hogy a jövőfa teljes maradjon.
-        const nextStates = _buildNextStatesFromFull(ec, state, weight);
+        // [FIX-FULL1] Index-alapú azonosítás, nem tartalom-alapú
+        const nextStates = _buildNextStatesFromFull(ec, state.originIndex);
         const subEV = _computeEV(nextStates, nextMyMask, nm, ne).ev;
         totalEV += pairWeight * subEV;
       }
@@ -281,43 +235,33 @@ function getAllCardEVs() {
   return _lastEVList;
 }
 
-// [EXACT3] Segédfüggvény: a teljes possibleEnemyHands-ból épít nextStates-t,
-// kivéve az ec lapot az adott állapotból.
-// Ez biztosítja, hogy a jövőfa nem ragad bele az első körös paritás-szűrőbe.
-function _buildNextStatesFromFull(ec, playedStateRef, playedStateWeight) {
-  // Az eredeti possibleEnemyHands-ban megtaláljuk a megfelelő állapotot
-  // a hand tartalom alapján (weight egyezés nem elégséges, ha több állapotnak
-  // azonos a keze — de a mergeEquivalentHands ezt már összevonta)
+// =============================================
+//  [FIX-FULL1] _buildNextStatesFromFull — index alapú
+//  Paraméterek:
+//    ec          — az ellenfél által kijátszott lap
+//    originIndex — az a possibleEnemyHands-beli index,
+//                  amelyből az ec lap kiesett
+// =============================================
+function _buildNextStatesFromFull(ec, originIndex) {
   const next = [];
-  const totalW = possibleEnemyHands.reduce((s, x) => s + x.weight, 0);
-
-  for (const s of possibleEnemyHands) {
-    // Ha ez az állapot tartalmazza az ec lapot és a hand megegyezik
-    // az aktuálisan kijátszott állapotéval (filteredNorm-ban a hand szűrt,
-    // de az ec lap biztosan benne volt, tehát az eredeti kézben is benne volt)
-    const hasEc = s.hand.includes(ec);
-    if (hasEc && _handsOverlap(s.hand, playedStateRef.hand, ec)) {
+  for (let i = 0; i < possibleEnemyHands.length; i++) {
+    const s = possibleEnemyHands[i];
+    if (i === originIndex) {
+      // Pontosan ebből az állapotból esik ki az ec lap
       const newHand = s.hand.filter(c => c !== ec);
-      next.push({ hand: newHand, weight: s.weight });
+      if (newHand.length > 0 || possibleEnemyHands.length === 1) {
+        next.push({ hand: newHand, weight: s.weight });
+      }
     } else {
       next.push({ hand: s.hand, weight: s.weight });
     }
   }
-
   const merged = mergeEquivalentHands(next);
   normalizeWeights(merged);
   return merged;
 }
 
-// Az eredeti (szűretlen) állapot keze tartalmazza-e a szűrt kéz összes lapját?
-function _handsOverlap(fullHand, filteredHand, playedCard) {
-  // A filteredHand az eredeti kéz paritás-szűrt változata.
-  // Akkor egyeznek, ha a filteredHand összes lapja szerepel a fullHand-ban.
-  for (const c of filteredHand) {
-    if (!fullHand.includes(c)) return false;
-  }
-  return true;
-}
+// [FIX-FULL3] _handsOverlap eltávolítva — már nem szükséges
 
 function _invalidateEVCache() {
   _lastEVList = null;
@@ -333,7 +277,6 @@ function getBestCard() {
 //  VALIDÁCIÓ
 // =============================================
 function _getResultAvailability() {
-  // [FIX3] Cache kulcs: possibleEnemyHands.length is benne
   const key = `${selectedMine}|${selectedEnemy}|${possibleEnemyHands.length}`;
   if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
 
@@ -393,7 +336,7 @@ function mergeEquivalentHands(states) {
 }
 
 // =============================================
-//  [BAY2] DEDUKCIÓ — Bayes-es frissítés
+//  [BAY2] DEDUKCIÓ
 // =============================================
 function deduceEnemyHands(myCard, enemyType, result) {
   const ok = _parityOk(enemyType);
@@ -642,7 +585,6 @@ function renderEnemyCards() {
   container.appendChild(oddRow);
   container.appendChild(evenRow);
 
-  // [FIX1] Kézméret-tartomány számítása
   const uniqueCount = Object.keys(cardCounts).filter(k => cardCounts[k] > 0).length;
   const minHandSize = Math.min(...possibleEnemyHands.map(s => s.hand.length));
   const maxHandSize = Math.max(...possibleEnemyHands.map(s => s.hand.length));
@@ -936,6 +878,7 @@ function confirmRound() {
 
   clearActionButtons();
 
+  // [FIX-CACHE] Cache törlés azonnal, a setTimeout előtt
   _evCache.clear();
   _invalidateEVCache();
 
