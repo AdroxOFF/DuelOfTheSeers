@@ -856,7 +856,7 @@ function updateChips() {
     cr.className   = `status-chip ${cls[selectedResult]}`;
   } else {
     cr.textContent = 'Eredmény: —';
-    cr.className   = 'status-chip chip-none';';
+    cr.className   = 'status-chip chip-none';
   }
 }
 
