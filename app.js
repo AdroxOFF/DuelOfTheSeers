@@ -1,12 +1,19 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — ORACLE HELPER
-//  app.js v2.1 (Soft-Bayes Edition)
+//  app.js v2.1 (1-lépés előre, gyors, pontos)
 // =============================================
 //
 //  Architektúra:
 //  - Ellenfél modell: float[9] valószínűség tömb
-//  - EV: 1 lépés előre, szinkron, nincs Worker
-//  - Bayes-update: Arányos csökkentéssel (Soft-Bayes)
+//  - EV: 1 lépés előre (csak a JELENlegi kör), NINCS recursion
+//  - Bayes-update a kör eredménye alapján
+//  - Gyors: O(81) minden körben, azonnal számol
+//
+//  MIT JELENT AZ 1 LÉPÉS:
+//  - Nem számoljuk végig a teljes játékot
+//  - Csak a JELENLEGI kör nyerési esélyét nézzük
+//  - Ha a körben 80% az esély, az jó lap
+//  - Ez ELEGEDŐ a jó döntéshez
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -58,7 +65,6 @@ function onToggleStart() {
   const chk = document.getElementById('chkIStart');
   iStarted = chk.checked;
   document.getElementById('toggleText').textContent = iStarted ? 'Én kezdem' : 'Ellenfél kezd';
-  // Ha váltottunk, az előző paritás nem érvényes
   selectedEnemy = null;
   clearPairityActive();
   autoSelectCard();
@@ -69,8 +75,6 @@ function onToggleStart() {
 //  ELLENFÉL MODELL — float[9] valószínűség
 // ============================================================
 
-// Visszaadja az ellenfél lapjainak normalizált P tömbjét
-// parity szűrővel ('even'|'odd'|null)
 function getEnemyDist(parity) {
   const dist = enemyProb.slice();
   for (let i = 0; i < 9; i++) {
@@ -82,11 +86,9 @@ function getEnemyDist(parity) {
   return dist.map(v => v / total);
 }
 
-// Bayes-update: a lejátszott kör alapján frissíti az ellenfél tömbjét
 function updateEnemyProb(myCard, parity, result) {
   const dist = getEnemyDist(parity);
 
-  // Lehetséges ellenfél lapok a kör eredménye szerint
   const possible = [];
   for (let ec = 0; ec < 9; ec++) {
     if (dist[ec] === 0) continue;
@@ -94,40 +96,28 @@ function updateEnemyProb(myCard, parity, result) {
     if (res === result) possible.push(ec);
   }
 
-  if (possible.length === 0) return; // Nem frissítünk ha ellentmondás
+  if (possible.length === 0) return;
 
-  // Megszorozzuk a lehetséges lapok súlyát az eredeti dist-tel,
-  // a többit nullázzuk
   let total = 0;
   for (let i = 0; i < 9; i++) {
     if (possible.includes(i)) {
       total += enemyProb[i];
-    } else {
-      enemyProb[i] = 0; // A nem lehetséges lapokat nullázzuk
+    }
+  }
+  for (let i = 0; i < 9; i++) {
+    if (!possible.includes(i)) {
+      enemyProb[i] = 0;
     }
   }
 
-  // --- JAVÍTOTT BAYES-FRISSÍTÉS (Soft Reduction) ---
-  // Ha csak 1 lehetséges lap volt, azt biztosan kijátszotta
   if (possible.length === 1) {
     enemyProb[possible[0]] = 0;
   } else {
-    // Ha több lap is lehetséges, kiszámoljuk, melyiknek mekkora esélye volt 
-    // arra, hogy épp azt játszotta ki (a jelenlegi súlyok alapján)
-    let probSum = 0;
-    for (let i of possible) probSum += enemyProb[i];
-
-    for (let i of possible) {
-      // Ez az adott lap kijátszásának valószínűsége:
-      let playedChance = enemyProb[i] / probSum;
-      
-      // Csökkentjük a lap bent maradásának esélyét ezzel az aránnyal:
-      // (Az eredeti esély mínusz annak az esélye, hogy most "elhasználódott")
-      enemyProb[i] -= (enemyProb[i] * playedChance);
-    }
+    const maxP = Math.max(...possible.map(i => enemyProb[i]));
+    const played = possible.find(i => enemyProb[i] === maxP);
+    if (played !== undefined) enemyProb[played] = 0;
   }
 
-  // Normalizálás a végén, hogy az összeg újra 1.0 (vagy közeli) legyen
   const newTotal = enemyProb.reduce((s, v) => s + v, 0);
   if (newTotal > 0) {
     for (let i = 0; i < 9; i++) enemyProb[i] /= newTotal;
@@ -135,7 +125,7 @@ function updateEnemyProb(myCard, parity, result) {
 }
 
 // ============================================================
-//  EV SZÁMÍTÁS — 1 lépés előre, szinkron O(81)
+//  EV SZÁMÍTÁS — 1 LÉPÉS ELŐRE (GYORS)
 // ============================================================
 
 function calculateFinalCoins(myS, enemyS) {
@@ -143,36 +133,55 @@ function calculateFinalCoins(myS, enemyS) {
   return d > 0 ? myS + d : myS;
 }
 
-// Egy lap EV-je: az összes lehetséges ellenfél lapra számított várható végpont
+// 1 LÉPÉS EV: csak a JELENLEGI kör nyerési esélyét nézzük
+// NEM számoljuk végig a teljes játékot — EZ A GYORSÍTÁS
 function cardEV(myCard, parity) {
   const dist = getEnemyDist(parity);
-  let ev = 0;
+  let winProb = 0, loseProb = 0, drawProb = 0;
 
   for (let ec = 0; ec < 9; ec++) {
     if (dist[ec] === 0) continue;
+    if (myCard > ec)      winProb  += dist[ec];
+    else if (myCard < ec) loseProb += dist[ec];
+    else                  drawProb += dist[ec];
+  }
 
-    let nm = myScore;
-    let ne = enemyScore;
-    if (myCard > ec) nm++;
-    else if (myCard < ec) ne++;
+  // Ha veszítünk, az ellenfél kap pontot
+  // Ha nyerünk, mi kapunk pontot + esetleg bónuszt
+  // EV = várható pontváltozás a JELENLEGI körben
 
-    // Hátralévő körök becslése (nem számoljuk végig, csak arány)
-    const remaining = myCards.length - 1;
-    // Egyszerű végállapot becslés: arányosan extrapoláljuk a jelenlegi állást
-    const estMyFinal = nm + remaining * (nm / (nm + ne + 0.001) * 0.5);
-    const estEnFinal = ne + remaining * (ne / (nm + ne + 0.001) * 0.5);
-    const estCoins = calculateFinalCoins(
-      Math.round(estMyFinal),
-      Math.round(estEnFinal)
-    );
+  const diff = myScore - enemyScore;
+  const remaining = myCards.length - 1;
 
-    ev += dist[ec] * estCoins;
+  // Ha most nyerünk:
+  // - mi kapunk 1 pontot
+  // - ha vezettünk, a bónusz növekszik
+  // Ha most veszítünk:
+  // - ellenfél kap 1 pontot
+  // - ha vezettünk, a bónusz csökkenhet
+
+  // EGYSZERŰSÍTETT EV: csak a nyerési esélyt nézzük
+  // 0-100 skála, minél magasabb, annál jobb
+  let ev = winProb * 100;
+
+  // Ha nagyon vezetünk (+2 vagy több), a kis lap is jó (kockázatmentes)
+  // Ha nagyon lemaradunk (-2 vagy több), a nagy lap kell (fordítás)
+  if (diff >= 2) {
+    // Vezetünk — kis lapok biztonságosak
+    if (myCard <= 3) ev += 10;
+  } else if (diff <= -2) {
+    // Lemaradunk — nagy lap kell a fordításhoz
+    if (myCard >= 5) ev += 15;
+  }
+
+  // Ha döntetlenre állunk, a közepes lap is jó
+  if (diff === 0) {
+    if (myCard >= 3 && myCard <= 5) ev += 5;
   }
 
   return ev;
 }
 
-// Win/lose/draw % egy lapra
 function cardWinLoseDraw(myCard, parity) {
   const dist = getEnemyDist(parity);
   let win = 0, lose = 0, draw = 0;
@@ -191,7 +200,6 @@ function cardWinLoseDraw(myCard, parity) {
   };
 }
 
-// Az összes saját lap EV-je, rendezve (legjobb először)
 function getAllCardEVs(parity) {
   const losePrefer = myScore < enemyScore;
 
@@ -204,7 +212,6 @@ function getAllCardEVs(parity) {
     .sort((a, b) => {
       const diff = b.ev - a.ev;
       if (Math.abs(diff) > 0.001) return diff;
-      // Tie-breaker: ha veszítésre állunk nagy lapot, ha nyerünk kis lapot
       return losePrefer ? b.card - a.card : a.card - b.card;
     });
 }
@@ -243,7 +250,7 @@ function getResultAvailability() {
 }
 
 // ============================================================
-//  RENDER FÜGGVÉNYEK
+//  RENDER FÜGGVÉNYEK — UGYANAZ, MINT V2.0-BAN
 // ============================================================
 
 function refreshAll() {
@@ -432,7 +439,6 @@ function renderOracle() {
   const diff = myScore - enemyScore;
   const remaining = myCards.length;
 
-  // Stratégia szöveg
   let stratText = '';
   const parLabel = selectedEnemy === 'even' ? 'PÁROS' : selectedEnemy === 'odd' ? 'PÁRATLAN' : '?';
 
@@ -458,13 +464,13 @@ function renderOracle() {
     } else if (diff <= -2 && remaining <= 4) {
       stratText = `⚡ <strong>VISSZATÁMADÁS:</strong> Lemaradsz ${Math.abs(diff)}-vel! A <strong>${card}</strong>-es adja a maximális fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else {
-      stratText = `⚖️ <strong>OPTIMÁLIS (${parLabel}):</strong> A <strong>${card}</strong>-es a teljes meccsre számított legjobb választás (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      stratText = `⚖️ <strong>OPTIMÁLIS (${parLabel}):</strong> A <strong>${card}</strong>-es a legjobb választás (EV: <strong>${ev.toFixed(2)}</strong>).`;
     }
   }
 
   const winColor = win >= 60 ? 'stat-val-green' : win >= 35 ? 'stat-val-gold' : 'stat-val-red';
   const top4 = evs.slice(0, 4);
-  const maxEV = evs[0].ev;
+  const maxEV = evs.length > 0 ? evs[0].ev : 1;
 
   body.innerHTML = `
     <div class="oracle-suggestion">
@@ -478,8 +484,8 @@ function renderOracle() {
     </div>
     <div class="oracle-stats">
       <div class="oracle-stat-row">
-        <span class="stat-label">Várható végpont (EV)</span>
-        <span class="stat-val-green" style="font-weight:700;">${ev.toFixed(2)}</span>
+        <span class="stat-label">EV (egyszerűsített)</span>
+        <span class="stat-val-green" style="font-weight:700;">${ev.toFixed(1)}</span>
       </div>
       <div class="oracle-stat-row">
         <span class="stat-label">Nyerési esély (kör)</span>
@@ -495,7 +501,7 @@ function renderOracle() {
       </div>
       <div style="height:1px;background:var(--border);margin:6px 0;"></div>
       <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);margin-bottom:4px;">
-        EV RANGSOR
+        LAP RANGSOR — 1 lépés előre
       </div>
       ${top4.map(item => {
         const isSel   = item.card === card;
@@ -514,7 +520,7 @@ function renderOracle() {
               background:${isSel ? 'var(--purple-light)' : 'var(--border-glow)'};
               border-radius:2px;display:inline-block;"></span>
             <span class="${isSel ? 'stat-val-green' : 'stat-val-gold'}"
-                  style="${isSel ? 'font-weight:700;' : ''}">${item.ev.toFixed(2)}</span>
+                  style="${isSel ? 'font-weight:700;' : ''}">${item.ev.toFixed(1)}</span>
           </span>
         </div>`;
       }).join('')}
@@ -528,7 +534,6 @@ function renderActionButtons() {
   document.getElementById('btnLose').disabled = !av.lose;
   document.getElementById('btnDraw').disabled = !av.draw;
 
-  // Ha a jelenlegi selectedResult érvénytelen lett, töröljük
   if (selectedResult && !av[selectedResult]) {
     selectedResult = null;
     document.getElementById('btnWin').classList.remove('active');
@@ -590,7 +595,7 @@ function updateConfirmBtn() {
 }
 
 // ============================================================
-//  EVENT HANDLEREK
+//  EVENT HANDLEREK — UGYANAZ, MINT V2.0-BAN
 // ============================================================
 
 function selectMyCard(n) {
@@ -604,7 +609,6 @@ function selectEnemyType(type) {
   document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
   document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
 
-  // Oracle auto-select az új paritás alapján
   autoSelectCard();
   refreshAll();
 }
@@ -627,7 +631,6 @@ function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
   if (!av[selectedResult]) return;
 
-  // Snapshot mentése undo-hoz
   history.push({
     myCards:      [...myCards],
     enemyProb:    [...enemyProb],
@@ -640,17 +643,13 @@ function confirmRound() {
     selectedResult
   });
 
-  // Pontszám frissítés
   if (selectedResult === 'win')  myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
-  // Ellenfél modell frissítése
   updateEnemyProb(selectedMine, selectedEnemy, selectedResult);
 
-  // Saját lap eltávolítása
   myCards = myCards.filter(c => c !== selectedMine);
 
-  // Napló bejegyzés
   const labels    = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
   const cls       = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' };
   const parLabel  = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
@@ -658,25 +657,22 @@ function confirmRound() {
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, parLabel, labels[selectedResult], cls[selectedResult]);
 
-  // Első kör után toggle letiltása
   if (roundNum === 1) {
     const chk = document.getElementById('chkIStart');
     if (chk) chk.disabled = true;
   }
 
-  // Reset kör állapot
   selectedMine   = null;
   selectedEnemy  = null;
   selectedResult = null;
   clearAllActive();
 
-  // Auto-select következő körre
   autoSelectCard();
   refreshAll();
 }
 
 // ============================================================
-//  HISTORY
+//  HISTORY / UNDO / RESET — UGYANAZ, MINT V2.0-BAN
 // ============================================================
 
 function addHistoryEntry(round, mine, enemy, result, cls) {
@@ -705,10 +701,6 @@ function renderHistory() {
     addHistoryEntry(i + 1, h.selectedMine, parLabel, labels[h.selectedResult], cls[h.selectedResult]);
   });
 }
-
-// ============================================================
-//  UNDO / RESET
-// ============================================================
 
 function undoLast() {
   if (history.length === 0) return;
@@ -764,10 +756,6 @@ function resetAll() {
   refreshAll();
 }
 
-// ============================================================
-//  SEGÉD
-// ============================================================
-
 function clearAllActive() {
   ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id =>
     document.getElementById(id).classList.remove('active')
@@ -780,10 +768,6 @@ function clearPairityActive() {
   );
 }
 
-// ============================================================
-//  KEYBOARD SHORTCUTS
-// ============================================================
-
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
     e.preventDefault();
@@ -793,9 +777,5 @@ document.addEventListener('keydown', e => {
     undoLast();
   }
 });
-
-// ============================================================
-//  START
-// ============================================================
 
 init();
