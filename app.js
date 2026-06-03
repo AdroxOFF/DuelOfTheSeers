@@ -1,7 +1,31 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v9.0
+//  app.js v9.2
 // =============================================
+//
+//  JAVÍTÁSOK v9.1 → v9.2:
+//  [FIX2]  _computeEV: a rekurzív belső szimuláció mostantól figyelembe
+//          veszi az enemyPlayWeight hookot. Korábban a jövőbeli körök
+//          számításában minden ellenfél-lap egyforma súlyt kapott (total /= eCnt),
+//          még ha a hook nem-egyenletes priort állított be. Most prior-súlyozott
+//          átlagot számol, így a teljes jövőfa konzisztens a hookkal.
+//          Egyenletes priornál (return 1) a viselkedés változatlan.
+//  [FIX3]  _getResultAvailability cache: a kulcs mostantól tartalmazza
+//          a possibleEnemyHands hosszát is, így nem adhat vissza elavult
+//          cachet ha az állapottér a rögzítés után megváltozott, de
+//          selectedMine és selectedEnemy véletlenül ugyanaz maradt.
+//  [FIX4]  iStarted + nincs paritás: az Oracle mostantól jelzi hogy
+//          az EV becslés paritás nélkül tágabb feltételezésen alapul,
+//          és a statisztikák paritás megadása után pontosabbak lesznek.
+//
+//  JAVÍTÁSOK v9.0 → v9.1:
+//  [FIX1]  renderEnemyCards: "Lehetséges: X / 9" félrevezető volt —
+//          X a súlyozott lapok száma, nem a kézben maradt lapok száma.
+//          Mostantól külön mutatja: hány különböző lap szerepel legalább
+//          egy lehetséges kézben (uniqueCount), és mi a kézméret-tartomány
+//          (minHandSize–maxHandSize). Így "Lehetséges lapok: 9 | Kéz: 5–5"
+//          azonnal láthatóvá teszi hogy az ellenfélnek már csak 5 lapja van,
+//          még ha mind a 9 lap elvileg előfordulhat is valamelyik kombinációban.
 //
 //  JAVÍTÁSOK v8.0 → v9.0:
 //  [BAY1]  possibleEnemyHands: [{hand, weight}] formátumra váltva.
@@ -73,31 +97,43 @@ function _finalScore(myS, enemyS) {
   return myS;
 }
 
+// [FIX2] Prior-súlyozott rekurzió: enemyPlayWeight a jövőfa minden szintjén.
+// Egyenletes priornál (return 1) azonos eredményt ad mint korábban.
 function _computeEV(myMask, enemyMask, myS, enemyS) {
   if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
 
   const key = `${myMask},${enemyMask},${myS},${enemyS}`;
   if (_evCache.has(key)) return _evCache.get(key);
 
-  const eCnt = _maskCount(enemyMask);
   const losePrefer = myS < enemyS;
   let bestEV = -Infinity, bestCard = -1;
+
+  // Ellenfél lapjainak prior-súlyai előre kiszámítva
+  let enemyWeightTotal = 0;
+  const enemyWeights = {};
+  for (let ec = 0; ec <= 8; ec++) {
+    if (!(enemyMask & (1 << ec))) continue;
+    const w = enemyPlayWeight(ec);
+    enemyWeights[ec] = w;
+    enemyWeightTotal += w;
+  }
 
   for (let mc = 0; mc <= 8; mc++) {
     if (!(myMask & (1 << mc))) continue;
     const nextMy = myMask ^ (1 << mc);
     let total = 0;
 
-    if (eCnt === 0) {
+    if (enemyWeightTotal === 0) {
       total = _finalScore(myS, enemyS);
     } else {
       for (let ec = 0; ec <= 8; ec++) {
         if (!(enemyMask & (1 << ec))) continue;
         let nm = myS, ne = enemyS;
         if (mc > ec) nm++; else if (mc < ec) ne++;
-        total += _computeEV(nextMy, enemyMask ^ (1 << ec), nm, ne).ev;
+        // [FIX2] Súlyozott átlag: w/total helyett 1/eCnt
+        total += (enemyWeights[ec] / enemyWeightTotal) *
+                 _computeEV(nextMy, enemyMask ^ (1 << ec), nm, ne).ev;
       }
-      total /= eCnt;
     }
 
     const isBetter = total > bestEV ||
@@ -207,7 +243,8 @@ function getBestCard() {
 //  VALIDÁCIÓ
 // =============================================
 function _getResultAvailability() {
-  const key = `${selectedMine}|${selectedEnemy}`;
+  // [FIX3] Cache kulcs: possibleEnemyHands.length is benne — elkerüli az elavult találatot
+  const key = `${selectedMine}|${selectedEnemy}|${possibleEnemyHands.length}`;
   if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
 
   const availability = { win: true, lose: true, draw: true };
@@ -517,13 +554,22 @@ function renderEnemyCards() {
   container.appendChild(oddRow);
   container.appendChild(evenRow);
 
+  // [FIX1] Kézméret-tartomány számítása — ez mutatja meg hány lapja maradt az ellenfélnek
   const uniqueCount = Object.keys(cardCounts).filter(k => cardCounts[k] > 0).length;
+  const minHandSize = Math.min(...possibleEnemyHands.map(s => s.hand.length));
+  const maxHandSize = Math.max(...possibleEnemyHands.map(s => s.hand.length));
+  const handSizeLabel = minHandSize === maxHandSize
+    ? `${minHandSize} lap`
+    : `${minHandSize}–${maxHandSize} lap`;
+
   const countEl = document.getElementById('enemyCount');
   if (countEl) {
-    const parityLabel = selectedEnemy === 'even' ? ' (páros szűrő)'
-                      : selectedEnemy === 'odd'  ? ' (páratlan szűrő)'
+    const parityLabel = selectedEnemy === 'even' ? ' · páros szűrő'
+                      : selectedEnemy === 'odd'  ? ' · páratlan szűrő'
                       : '';
-    countEl.textContent = `Lehetséges: ${uniqueCount} / 9${parityLabel}`;
+    // uniqueCount: hány különböző lap szerepel legalább egy lehetséges kézben
+    // handSizeLabel: mennyi lap van ténylegesen az ellenfél kezében
+    countEl.textContent = `Kézben: ${handSizeLabel} · ${uniqueCount} féle lap lehetséges${parityLabel}`;
   }
 
   const comboEl = document.getElementById('comboCount');
@@ -569,15 +615,22 @@ function renderOracle() {
   const remaining = myCards.length;
 
   let strategyDesc = '';
+  // [FIX4] iStarted módban: ha még nincs paritás, jelezzük a bizonytalanságot
+  const evIsApprox = iStarted && selectedEnemy === null;
+
   if (iStarted) {
+    // Paritás figyelmeztetés szövege — csak vak nyitásban látható
+    const approxNote = evIsApprox
+      ? ` <span style="font-size:9px;color:var(--gold-light);opacity:0.8;">(paritás nélkül becsült — add meg a hátlapot a pontos EV-hez)</span>`
+      : '';
     if (win <= 20) {
-      strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${suggestedCard}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot ellene. Várható végpont: <strong>${ev.toFixed(2)}</strong>.`;
+      strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${suggestedCard}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot ellene. Várható végpont: <strong>${ev.toFixed(2)}</strong>.${approxNote}`;
     } else if (diff >= 2 && remaining <= 4) {
-      strategyDesc = `🛡️ <strong>ELŐNY TARTÁSA:</strong> Vezetsz +${diff}-vel. A <strong>${suggestedCard}</strong>-es minimalizálja a kockázatot (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      strategyDesc = `🛡️ <strong>ELŐNY TARTÁSA:</strong> Vezetsz +${diff}-vel. A <strong>${suggestedCard}</strong>-es minimalizálja a kockázatot (EV: <strong>${ev.toFixed(2)}</strong>).${approxNote}`;
     } else if (diff <= -2 && remaining <= 4) {
-      strategyDesc = `⚡ <strong>FORDÍTÁS KELL:</strong> Lemaradsz! A <strong>${suggestedCard}</strong>-es adja a legjobb fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      strategyDesc = `⚡ <strong>FORDÍTÁS KELL:</strong> Lemaradsz! A <strong>${suggestedCard}</strong>-es adja a legjobb fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).${approxNote}`;
     } else {
-      strategyDesc = `🎭 <strong>VAK NYITÁS:</strong> Nem látjuk az ellenfél hátlapját. A <strong>${suggestedCard}</strong>-es a legjobb várható végpontot adja (<strong>${ev.toFixed(2)}</strong>).`;
+      strategyDesc = `🎭 <strong>VAK NYITÁS:</strong> Nem látjuk az ellenfél hátlapját. A <strong>${suggestedCard}</strong>-es a legjobb várható végpontot adja (<strong>${ev.toFixed(2)}</strong>).${approxNote}`;
     }
   } else {
     const parityLabel = selectedEnemy === 'even' ? 'PÁROS' : 'PÁRATLAN';
@@ -614,7 +667,7 @@ function renderOracle() {
         <span class="stat-val-green" style="font-weight:700;">${ev.toFixed(2)}</span>
       </div>
       <div class="oracle-stat-row">
-        <span class="stat-label">Nyerési esély (kör)</span>
+        <span class="stat-label">Nyerési esély (kör)${evIsApprox ? " ≈" : ""}</span>
         <span class="${winColor}">${win}%</span>
       </div>
       <div class="oracle-stat-row">
