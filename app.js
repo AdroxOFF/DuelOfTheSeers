@@ -1,544 +1,269 @@
 // =============================================
-//  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v11.2 (Final Clean Architecture)
+//  LÁTÓK PÁRBAJA — ORACLE HELPER
+//  app.js v2.1 (Soft-Bayes Edition)
 // =============================================
 //
-//  JAVÍTÁSOK v11.1 → v11.2:
-//  [FIX-1]  calculateFinalCoins(): Egységes végső érme/pont kalkulátor
-//          a teljes appban.
-//  [FIX-2]  compareCardEVs(): Központi, egységes tie-breaker helper
-//          vak kezdésre és látó kezdésre.
-//  [FIX-3]  _getCacheKey(): Minden állapotra ugyanaz a biztonságos,
-//          stabil string fingerprint.
-//  [FIX-4]  mergeEquivalentHands(): Garantált rendezés + stabil merge.
-//  [FIX-5]  Scoreboard / Oracle / EV motor szövegek egységesítve.
+//  Architektúra:
+//  - Ellenfél modell: float[9] valószínűség tömb
+//  - EV: 1 lépés előre, szinkron, nincs Worker
+//  - Bayes-update: Arányos csökkentéssel (Soft-Bayes)
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
-let myCards = [...ALL_CARDS];
-let possibleEnemyHands = [{ hand: [...ALL_CARDS], weight: 1 }];
-
+// ── Játékállapot ──────────────────────────────
+let myCards = [];
+let enemyProb = [];       // float[9]: P(ellenfél még tartja a lapot)
 let myScore = 0;
 let enemyScore = 0;
+let roundNum = 0;
 
+// ── Kör állapot ──────────────────────────────
 let selectedMine = null;
-let selectedEnemy = null;
-let selectedResult = null;
+let selectedEnemy = null;  // 'even' | 'odd' | null
+let selectedResult = null; // 'win' | 'lose' | 'draw' | null
 let iStarted = false;
 
+// ── History (undo-hoz) ────────────────────────
 let history = [];
-let roundNum = 0;
-let isConfirming = false;
-let _cardManuallySelected = false;
 
-// ============================================================================
-//  1. KÖZÖS MAG (PURE FUNCTIONS)
-// ============================================================================
+// ============================================================
+//  INICIALIZÁLÁS
+// ============================================================
 
-function enemyPlayWeight(card) {
-  return 1;
+function init() {
+  myCards = [...ALL_CARDS];
+  enemyProb = new Array(9).fill(1.0);
+  myScore = 0;
+  enemyScore = 0;
+  roundNum = 0;
+  selectedMine = null;
+  selectedEnemy = null;
+  selectedResult = null;
+  iStarted = false;
+  history = [];
+
+  const chk = document.getElementById('chkIStart');
+  if (chk) {
+    chk.checked = false;
+    chk.disabled = false;
+    chk.addEventListener('change', onToggleStart);
+  }
+
+  refreshAll();
+  renderHistory();
 }
+
+function onToggleStart() {
+  const chk = document.getElementById('chkIStart');
+  iStarted = chk.checked;
+  document.getElementById('toggleText').textContent = iStarted ? 'Én kezdem' : 'Ellenfél kezd';
+  // Ha váltottunk, az előző paritás nem érvényes
+  selectedEnemy = null;
+  clearPairityActive();
+  autoSelectCard();
+  refreshAll();
+}
+
+// ============================================================
+//  ELLENFÉL MODELL — float[9] valószínűség
+// ============================================================
+
+// Visszaadja az ellenfél lapjainak normalizált P tömbjét
+// parity szűrővel ('even'|'odd'|null)
+function getEnemyDist(parity) {
+  const dist = enemyProb.slice();
+  for (let i = 0; i < 9; i++) {
+    if (parity === 'even' && i % 2 !== 0) dist[i] = 0;
+    if (parity === 'odd'  && i % 2 === 0) dist[i] = 0;
+  }
+  const total = dist.reduce((s, v) => s + v, 0);
+  if (total === 0) return dist;
+  return dist.map(v => v / total);
+}
+
+// Bayes-update: a lejátszott kör alapján frissíti az ellenfél tömbjét
+function updateEnemyProb(myCard, parity, result) {
+  const dist = getEnemyDist(parity);
+
+  // Lehetséges ellenfél lapok a kör eredménye szerint
+  const possible = [];
+  for (let ec = 0; ec < 9; ec++) {
+    if (dist[ec] === 0) continue;
+    const res = myCard > ec ? 'win' : myCard < ec ? 'lose' : 'draw';
+    if (res === result) possible.push(ec);
+  }
+
+  if (possible.length === 0) return; // Nem frissítünk ha ellentmondás
+
+  // Megszorozzuk a lehetséges lapok súlyát az eredeti dist-tel,
+  // a többit nullázzuk
+  let total = 0;
+  for (let i = 0; i < 9; i++) {
+    if (possible.includes(i)) {
+      total += enemyProb[i];
+    } else {
+      enemyProb[i] = 0; // A nem lehetséges lapokat nullázzuk
+    }
+  }
+
+  // --- JAVÍTOTT BAYES-FRISSÍTÉS (Soft Reduction) ---
+  // Ha csak 1 lehetséges lap volt, azt biztosan kijátszotta
+  if (possible.length === 1) {
+    enemyProb[possible[0]] = 0;
+  } else {
+    // Ha több lap is lehetséges, kiszámoljuk, melyiknek mekkora esélye volt 
+    // arra, hogy épp azt játszotta ki (a jelenlegi súlyok alapján)
+    let probSum = 0;
+    for (let i of possible) probSum += enemyProb[i];
+
+    for (let i of possible) {
+      // Ez az adott lap kijátszásának valószínűsége:
+      let playedChance = enemyProb[i] / probSum;
+      
+      // Csökkentjük a lap bent maradásának esélyét ezzel az aránnyal:
+      // (Az eredeti esély mínusz annak az esélye, hogy most "elhasználódott")
+      enemyProb[i] -= (enemyProb[i] * playedChance);
+    }
+  }
+
+  // Normalizálás a végén, hogy az összeg újra 1.0 (vagy közeli) legyen
+  const newTotal = enemyProb.reduce((s, v) => s + v, 0);
+  if (newTotal > 0) {
+    for (let i = 0; i < 9; i++) enemyProb[i] /= newTotal;
+  }
+}
+
+// ============================================================
+//  EV SZÁMÍTÁS — 1 lépés előre, szinkron O(81)
+// ============================================================
 
 function calculateFinalCoins(myS, enemyS) {
   const d = myS - enemyS;
   return d > 0 ? myS + d : myS;
 }
 
-function compareCardEVs(a, b, isBlind, losePrefer) {
-  const diff = b.ev - a.ev;
-  if (Math.abs(diff) > 0.0001) return diff;
-  if (isBlind) return a.card - b.card;
-  return losePrefer ? b.card - a.card : a.card - b.card;
-}
+// Egy lap EV-je: az összes lehetséges ellenfél lapra számított várható végpont
+function cardEV(myCard, parity) {
+  const dist = getEnemyDist(parity);
+  let ev = 0;
 
-function _getCacheKey(states, myMask, myS, enemyS) {
-  let fp = '';
-  for (let i = 0; i < states.length; i++) {
-    const sorted = states[i].hand.slice().sort((a, b) => a - b);
-    fp += sorted.join('') + ':' + Math.round(states[i].weight * 10000) + '|';
-  }
-  return `${fp}${myMask}_${myS}_${enemyS}`;
-}
+  for (let ec = 0; ec < 9; ec++) {
+    if (dist[ec] === 0) continue;
 
-function mergeEquivalentHands(states) {
-  const map = new Map();
-  for (const s of states) {
-    const sorted = s.hand.slice().sort((a, b) => a - b);
-    const key = sorted.join(',');
-    if (!map.has(key)) {
-      map.set(key, { hand: sorted, weight: s.weight });
-    } else {
-      map.get(key).weight += s.weight;
-    }
-  }
-  return [...map.values()];
-}
+    let nm = myScore;
+    let ne = enemyScore;
+    if (myCard > ec) nm++;
+    else if (myCard < ec) ne++;
 
-function normalizeWeights(states) {
-  const total = states.reduce((s, x) => s + x.weight, 0);
-  if (total === 0) return;
-  for (const s of states) s.weight /= total;
-}
+    // Hátralévő körök becslése (nem számoljuk végig, csak arány)
+    const remaining = myCards.length - 1;
+    // Egyszerű végállapot becslés: arányosan extrapoláljuk a jelenlegi állást
+    const estMyFinal = nm + remaining * (nm / (nm + ne + 0.001) * 0.5);
+    const estEnFinal = ne + remaining * (ne / (nm + ne + 0.001) * 0.5);
+    const estCoins = calculateFinalCoins(
+      Math.round(estMyFinal),
+      Math.round(estEnFinal)
+    );
 
-function _buildNextStates(states, playedStateIndex, ec) {
-  const next = [];
-  for (let i = 0; i < states.length; i++) {
-    const s = states[i];
-    if (i === playedStateIndex) {
-      const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0 || states.length === 1) {
-        next.push({ hand: newHand, weight: s.weight });
-      }
-    } else {
-      next.push(s);
-    }
-  }
-  const merged = mergeEquivalentHands(next);
-  normalizeWeights(merged);
-  return merged;
-}
-
-function _computeEV(states, myMask, myS, enemyS, cache) {
-  if (myMask === 0) return { ev: calculateFinalCoins(myS, enemyS), best: -1 };
-
-  const key = _getCacheKey(states, myMask, myS, enemyS);
-  if (cache.has(key)) return cache.get(key);
-
-  const losePrefer = myS < enemyS;
-  let bestEV = -Infinity;
-  let bestCard = -1;
-
-  const totalStateWeight = states.reduce((s, x) => s + x.weight, 0);
-  if (totalStateWeight === 0) {
-    const r = { ev: calculateFinalCoins(myS, enemyS), best: -1 };
-    cache.set(key, r);
-    return r;
+    ev += dist[ec] * estCoins;
   }
 
-  for (let mc = 0; mc <= 8; mc++) {
-    if (!(myMask & (1 << mc))) continue;
+  return ev;
+}
 
-    const nextMyMask = myMask ^ (1 << mc);
-    let totalEV = 0;
+// Win/lose/draw % egy lapra
+function cardWinLoseDraw(myCard, parity) {
+  const dist = getEnemyDist(parity);
+  let win = 0, lose = 0, draw = 0;
 
-    for (let stateIdx = 0; stateIdx < states.length; stateIdx++) {
-      const state = states[stateIdx];
-      const { hand, weight } = state;
-      const hLen = hand.length;
-      if (hLen === 0) continue;
-
-      const playProb = 1 / hLen;
-      const stateContrib = weight / totalStateWeight;
-
-      for (let i = 0; i < hLen; i++) {
-        const ec = hand[i];
-        let nm = myS;
-        let ne = enemyS;
-        if (mc > ec) nm++;
-        else if (mc < ec) ne++;
-
-        const nextStates = _buildNextStates(states, stateIdx, ec);
-        const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
-        totalEV += stateContrib * playProb * subEV;
-      }
-    }
-
-    const isBetter =
-      totalEV > bestEV ||
-      (Math.abs(totalEV - bestEV) <= 0.0001 &&
-        (losePrefer ? mc > bestCard : mc < bestCard));
-
-    if (isBetter) {
-      bestEV = totalEV;
-      bestCard = mc;
-    }
+  for (let ec = 0; ec < 9; ec++) {
+    if (dist[ec] === 0) continue;
+    if (myCard > ec)      win  += dist[ec];
+    else if (myCard < ec) lose += dist[ec];
+    else                  draw += dist[ec];
   }
 
-  const r = { ev: bestEV, best: bestCard };
-  cache.set(key, r);
-  return r;
+  return {
+    win:  Math.round(win  * 100),
+    lose: Math.round(lose * 100),
+    draw: Math.round(draw * 100)
+  };
 }
 
-function _parityOk(parity) {
-  if (parity === 'even') return c => c % 2 === 0;
-  if (parity === 'odd') return c => c % 2 !== 0;
-  return () => true;
-}
-
-function _buildNextStatesFromFull(possibleEnemyHands, ec, originIndex) {
-  const next = [];
-  for (let i = 0; i < possibleEnemyHands.length; i++) {
-    const s = possibleEnemyHands[i];
-    if (i === originIndex) {
-      const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0 || possibleEnemyHands.length === 1) {
-        next.push({ hand: newHand, weight: s.weight });
-      }
-    } else {
-      next.push({ hand: s.hand, weight: s.weight });
-    }
-  }
-  const merged = mergeEquivalentHands(next);
-  normalizeWeights(merged);
-  return merged;
-}
-
-function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, cache) {
-  if (myCards.length === 0) return [];
-
-  const ok = _parityOk(selectedEnemy);
+// Az összes saját lap EV-je, rendezve (legjobb először)
+function getAllCardEVs(parity) {
   const losePrefer = myScore < enemyScore;
-  const isBlind = selectedEnemy === null;
-  const myMask = myCards.reduce((m, c) => m | (1 << c), 0);
-
-  const filteredStates = [];
-  for (let i = 0; i < possibleEnemyHands.length; i++) {
-    const s = possibleEnemyHands[i];
-    const filteredHand = s.hand.filter(ok);
-    if (filteredHand.length > 0) {
-      filteredStates.push({ hand: filteredHand, weight: s.weight, originIndex: i });
-    }
-  }
-
-  if (filteredStates.length === 0) {
-    return myCards
-      .map(myCard => ({
-        card: myCard,
-        ev: calculateFinalCoins(myScore, enemyScore),
-        win: 0,
-        lose: 0,
-        draw: 0
-      }))
-      .sort((a, b) => compareCardEVs(a, b, isBlind, losePrefer));
-  }
-
-  const filteredNorm = filteredStates.map(s => ({
-    hand: [...s.hand],
-    weight: s.weight,
-    originIndex: s.originIndex
-  }));
-  const filteredTotal = filteredNorm.reduce((s, x) => s + x.weight, 0);
-  for (const s of filteredNorm) s.weight /= filteredTotal;
 
   return myCards
-    .map(myCard => {
-      const nextMyMask = myMask ^ (1 << myCard);
-      let totalEV = 0;
-      let w = 0, l = 0, d = 0;
-      const totalStateWeight = filteredNorm.reduce((s, x) => s + x.weight, 0);
-
-      for (const state of filteredNorm) {
-        const { hand, weight } = state;
-        const hLen = hand.length;
-        if (hLen === 0) continue;
-
-        const playProb = 1 / hLen;
-
-        for (let i = 0; i < hLen; i++) {
-          const ec = hand[i];
-          const pairWeight = (weight / totalStateWeight) * playProb;
-
-          let nm = myScore;
-          let ne = enemyScore;
-          if (myCard > ec) {
-            nm++;
-            w += pairWeight;
-          } else if (myCard < ec) {
-            ne++;
-            l += pairWeight;
-          } else {
-            d += pairWeight;
-          }
-
-          const nextStates = _buildNextStatesFromFull(possibleEnemyHands, ec, state.originIndex);
-          const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
-          totalEV += pairWeight * subEV;
-        }
-      }
-
-      return {
-        card: myCard,
-        ev: totalEV,
-        win: Math.round(w * 100),
-        lose: Math.round(l * 100),
-        draw: Math.round(d * 100)
-      };
-    })
-    .sort((a, b) => compareCardEVs(a, b, isBlind, losePrefer));
+    .map(c => ({
+      card: c,
+      ev: cardEV(c, parity),
+      ...cardWinLoseDraw(c, parity)
+    }))
+    .sort((a, b) => {
+      const diff = b.ev - a.ev;
+      if (Math.abs(diff) > 0.001) return diff;
+      // Tie-breaker: ha veszítésre állunk nagy lapot, ha nyerünk kis lapot
+      return losePrefer ? b.card - a.card : a.card - b.card;
+    });
 }
 
-// ============================================================================
-//  2. WEB WORKER INJEKCIÓ
-// ============================================================================
+// ============================================================
+//  AUTO-SELECT — Oracle automatikusan kiválaszt
+// ============================================================
 
-let _worker = null;
-let _workerBusy = false;
-let _pendingWorkerRequest = null;
-
-function _initWorker() {
-  if (_worker) {
-    _worker.terminate();
+function autoSelectCard() {
+  const evs = getAllCardEVs(selectedEnemy);
+  if (evs.length > 0) {
+    selectedMine = evs[0].card;
   }
-
-  const workerString = `
-    ${enemyPlayWeight.toString()}
-    ${calculateFinalCoins.toString()}
-    ${compareCardEVs.toString()}
-    ${_getCacheKey.toString()}
-    ${mergeEquivalentHands.toString()}
-    ${normalizeWeights.toString()}
-    ${_buildNextStates.toString()}
-    ${_computeEV.toString()}
-    ${_parityOk.toString()}
-    ${_buildNextStatesFromFull.toString()}
-    ${getAllCardEVsCore.toString()}
-
-    const _workerCache = new Map();
-
-    self.onmessage = function(e) {
-      const { myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore } = e.data;
-      _workerCache.clear();
-      const evList = getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _workerCache);
-      self.postMessage({ evList });
-    };
-  `;
-
-  const blob = new Blob([workerString], { type: 'application/javascript' });
-  _worker = new Worker(URL.createObjectURL(blob));
-
-  _worker.onmessage = function(e) {
-    _workerBusy = false;
-    _lastEVList = e.data.evList;
-    _lastEVListReady = true;
-
-    if (_pendingWorkerRequest) {
-      const req = _pendingWorkerRequest;
-      _pendingWorkerRequest = null;
-      _sendToWorker(req);
-    } else {
-      _refreshUI();
-    }
-  };
-
-  _worker.onerror = function(err) {
-    console.error('Worker hiba:', err);
-    _workerBusy = false;
-    _lastEVList = getAllCardEVsFallback();
-    _lastEVListReady = true;
-    _refreshUI();
-  };
 }
 
-function _sendToWorker(data) {
-  if (_workerBusy) {
-    _pendingWorkerRequest = data;
-    return;
-  }
-  _workerBusy = true;
-  _lastEVListReady = false;
-  _worker.postMessage(data);
-}
+// ============================================================
+//  EREDMÉNY GOMBOK ELÉRHETŐSÉGE
+// ============================================================
 
-function _requestEVComputation() {
-  _lastEVList = null;
-  _lastEVListReady = false;
-  _sendToWorker({
-    myCards: [...myCards],
-    possibleEnemyHands: possibleEnemyHands.map(s => ({ hand: [...s.hand], weight: s.weight })),
-    selectedEnemy,
-    myScore,
-    enemyScore
-  });
-}
-
-// ============================================================================
-//  3. FŐSZÁL (UI, FALLBACK, HISTORY, ÁLLAPOT)
-// ============================================================================
-
-const _mainCache = new Map();
-let _lastEVList = null;
-let _lastEVListReady = false;
-let _lastValidation = null;
-
-function getAllCardEVsFallback() {
-  _mainCache.clear();
-  return getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _mainCache);
-}
-
-function getAllCardEVs() {
-  return _lastEVList || [];
-}
-
-function _invalidateEVCache() {
-  _lastEVList = null;
-  _lastEVListReady = false;
-  _lastValidation = null;
-}
-
-function getBestCard() {
-  const evs = getAllCardEVs();
-  return evs.length > 0 ? evs[0].card : null;
-}
-
-function _getWeightedCards(parity) {
-  const ok = _parityOk(parity);
-  let cardCounts = {}, total = 0;
-  for (const state of possibleEnemyHands) {
-    const { hand, weight } = state;
-    for (const c of hand.filter(ok)) {
-      cardCounts[c] = (cardCounts[c] || 0) + weight;
-      total += weight;
-    }
-  }
-  return { cardCounts, total };
-}
-
-function _getResultAvailability() {
-  const key = `${selectedMine}|${selectedEnemy}|${possibleEnemyHands.length}`;
-  if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
-
-  const availability = { win: true, lose: true, draw: true };
-
+function getResultAvailability() {
   if (selectedMine === null || selectedEnemy === null) {
-    availability.win = false;
-    availability.lose = false;
-    availability.draw = false;
-    _lastValidation = { key, result: availability };
-    return availability;
+    return { win: false, lose: false, draw: false };
   }
 
-  const ok = _parityOk(selectedEnemy);
+  const dist = getEnemyDist(selectedEnemy);
+  const av = { win: false, lose: false, draw: false };
 
-  if (!ok(selectedMine)) {
-    availability.draw = false;
+  for (let ec = 0; ec < 9; ec++) {
+    if (dist[ec] === 0) continue;
+    if (ec < selectedMine) av.win  = true;
+    if (ec > selectedMine) av.lose = true;
+    if (ec === selectedMine) av.draw = true;
   }
 
-  for (const res of ['win', 'lose', 'draw']) {
-    if (!availability[res]) continue;
-    let found = false;
-    for (const state of possibleEnemyHands) {
-      let candidates = state.hand.filter(c => ok(c));
-      if (res === 'win') candidates = candidates.filter(c => c < selectedMine);
-      else if (res === 'lose') candidates = candidates.filter(c => c > selectedMine);
-      else if (res === 'draw') candidates = candidates.filter(c => c === selectedMine);
-      if (candidates.length > 0) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) availability[res] = false;
-  }
-
-  _lastValidation = { key, result: availability };
-  return availability;
+  return av;
 }
 
-function deduceEnemyHands(myCard, enemyType, result) {
-  const ok = _parityOk(enemyType);
-  const newStates = [];
+// ============================================================
+//  RENDER FÜGGVÉNYEK
+// ============================================================
 
-  for (const state of possibleEnemyHands) {
-    const { hand, weight } = state;
-
-    let candidates = hand.filter(c => ok(c));
-    if (result === 'win') candidates = candidates.filter(c => c < myCard);
-    else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
-    else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
-
-    if (candidates.length === 0) continue;
-
-    const playProb = 1 / candidates.length;
-
-    candidates.forEach((playedCard) => {
-      const newHand = [];
-      for (let i = 0; i < hand.length; i++) {
-        if (hand[i] !== playedCard) newHand.push(hand[i]);
-      }
-      newStates.push({ hand: newHand, weight: weight * playProb });
-    });
-  }
-
-  if (newStates.length === 0) return possibleEnemyHands;
-
-  const merged = mergeEquivalentHands(newStates);
-  normalizeWeights(merged);
-  return merged;
-}
-
-function autoSelectOracleCard() {
-  const best = getBestCard();
-  if (best !== null) {
-    selectedMine = best;
-  }
-  _cardManuallySelected = false;
-}
-
-let _lastRenderState = null;
-
-function _getRenderStateKey() {
-  return [
-    selectedMine,
-    selectedEnemy,
-    selectedResult,
-    myScore,
-    enemyScore,
-    myCards.join(','),
-    possibleEnemyHands.length,
-    _lastEVListReady ? 'ready' : 'pending',
-    iStarted ? '1' : '0'
-  ].join('|');
-}
-
-function init() {
-  _initWorker();
-
-  const chk = document.getElementById('chkIStart');
-  if (chk) {
-    chk.addEventListener('change', () => {
-      iStarted = chk.checked;
-      if (iStarted) {
-        selectedEnemy = null;
-        document.getElementById('btnEven').classList.remove('active');
-        document.getElementById('btnOdd').classList.remove('active');
-      }
-      _invalidateEVCache();
-      _requestEVComputation();
-      _refreshUI();
-    });
-  }
-
-  _requestEVComputation();
-  updateScoreBoard();
-  _refreshUI();
-  renderHistory();
-}
-
-function _refreshUI() {
-  const stateKey = _getRenderStateKey();
-  if (stateKey === _lastRenderState) return;
-  _lastRenderState = stateKey;
-
+function refreshAll() {
+  renderScoreBoard();
   renderMyCards();
   renderEnemyCards();
   renderOracle();
-  updateResultButtons();
-  updatePairityButtons();
-  updateConfirmBtn();
+  renderActionButtons();
   updateChips();
+  updateConfirmBtn();
 }
 
-// ============================================================================
-//  RENDER FUNKCIÓK
-// ============================================================================
-
-function updateScoreBoard() {
-  document.getElementById('scoreMine').textContent = myScore;
+function renderScoreBoard() {
+  document.getElementById('scoreMine').textContent  = myScore;
   document.getElementById('scoreEnemy').textContent = enemyScore;
 
   const diff = myScore - enemyScore;
-  const finalCoins = calculateFinalCoins(myScore, enemyScore);
+  const coins = calculateFinalCoins(myScore, enemyScore);
   const diffEl = document.getElementById('scoreDiff');
+  const projEl = document.getElementById('finalScoreProj');
 
   if (diff > 0) {
     diffEl.textContent = `Vezetsz: +${diff}`;
@@ -554,81 +279,53 @@ function updateScoreBoard() {
     diffEl.style.borderColor = 'var(--border)';
   }
 
-  const finalProj = document.getElementById('finalScoreProj');
   if (myCards.length === 0) {
     if (myScore > enemyScore) {
-      finalProj.innerHTML = `🏆 Játék vége! Győzelem! Végső érme: <strong style="color:var(--emerald-light);font-size:16px;">${finalCoins}</strong>`;
+      projEl.innerHTML = `🏆 Játék vége! Győzelem! Végső érme: <strong style="color:var(--emerald-light);font-size:16px;">${coins}</strong>`;
     } else if (enemyScore > myScore) {
-      finalProj.innerHTML = `💀 Játék vége! Vereség. Megszerzett érme: ${finalCoins}`;
+      projEl.innerHTML = `💀 Játék vége! Vereség. Megszerzett érme: ${coins}`;
     } else {
-      finalProj.innerHTML = `🤝 Játék vége! Döntetlen. Megszerzett érme: ${finalCoins}`;
+      projEl.innerHTML = `🤝 Játék vége! Döntetlen. Megszerzett érme: ${coins}`;
     }
   } else {
-    if (myScore > enemyScore) {
-      finalProj.innerHTML = `Ha most nyernél, a végső érme: <strong style="color:var(--gold-light);font-size:15px;">${finalCoins}</strong> lenne.`;
+    if (diff > 0) {
+      projEl.innerHTML = `Ha most nyernél, a végső érme: <strong style="color:var(--gold-light);font-size:15px;">${coins}</strong> lenne.`;
     } else {
-      finalProj.innerHTML = `Várható végeredmény: <span style="color:var(--text-dim)">Jelenleg nincs bónusz pont. (Alap: ${myScore})</span>`;
+      projEl.innerHTML = `Várható végeredmény: <span style="color:var(--text-dim)">Jelenleg nincs bónusz pont. (Alap: ${myScore})</span>`;
     }
   }
-}
-
-function updateResultButtons() {
-  const av = _getResultAvailability();
-  const btnWin = document.getElementById('btnWin');
-  const btnLose = document.getElementById('btnLose');
-  const btnDraw = document.getElementById('btnDraw');
-
-  btnWin.disabled = !av.win;
-  btnLose.disabled = !av.lose;
-  btnDraw.disabled = !av.draw;
-
-  if (selectedResult && !av[selectedResult]) {
-    selectedResult = null;
-    btnWin.classList.remove('active');
-    btnLose.classList.remove('active');
-    btnDraw.classList.remove('active');
-  }
-}
-
-function updatePairityButtons() {
-  document.getElementById('btnEven').disabled = false;
-  document.getElementById('btnOdd').disabled = false;
 }
 
 function renderMyCards() {
   const container = document.getElementById('myCardsRow');
   container.innerHTML = '';
 
-  const oddRow = document.createElement('div');
-  oddRow.className = 'cards-sub-row';
+  const oddRow  = document.createElement('div');
+  oddRow.className  = 'cards-sub-row';
   const evenRow = document.createElement('div');
   evenRow.className = 'cards-sub-row';
 
-  const evList = getAllCardEVs();
+  const evs = getAllCardEVs(selectedEnemy);
   const evMap = {};
-  evList.forEach(x => {
-    evMap[x.card] = x;
-  });
-  const maxEV = evList.length > 0 ? evList[0].ev : 0;
-
-  const isComputing = !_lastEVListReady && myCards.length > 0;
+  evs.forEach(x => { evMap[x.card] = x; });
+  const maxEV = evs.length > 0 ? evs[0].ev : 0;
 
   ALL_CARDS.forEach(n => {
-    const isEven = n % 2 === 0;
-    const inHand = myCards.includes(n);
-    const isSelected = n === selectedMine;
+    const isEven  = n % 2 === 0;
+    const inHand  = myCards.includes(n);
+    const isSel   = n === selectedMine;
 
     const btn = document.createElement('button');
     btn.className = [
       'card-btn',
       isEven ? 'even' : 'odd',
       !inHand ? 'used' : '',
-      isSelected ? 'selected-mine' : ''
+      isSel   ? 'selected-mine' : ''
     ].filter(Boolean).join(' ');
     btn.disabled = !inHand;
 
     const numSpan = document.createElement('span');
-    numSpan.className = 'card-num';
+    numSpan.className   = 'card-num';
     numSpan.textContent = n;
     btn.appendChild(numSpan);
 
@@ -638,13 +335,10 @@ function renderMyCards() {
     if (inHand && evMap[n] !== undefined) {
       const ev = evMap[n].ev;
       badge.textContent = ev.toFixed(1);
-      if (ev === maxEV && maxEV > 0) badge.classList.add('chance-100');
-      else if (ev >= maxEV * 0.9) badge.classList.add('chance-high');
-    } else if (inHand && isComputing) {
-      badge.textContent = '…';
-      badge.style.opacity = '0.5';
+      if (Math.abs(ev - maxEV) < 0.001) badge.classList.add('chance-100');
+      else if (ev >= maxEV * 0.92)      badge.classList.add('chance-high');
     } else {
-      badge.textContent = '—';
+      badge.textContent  = '—';
       badge.style.opacity = '0.3';
     }
     btn.appendChild(badge);
@@ -652,44 +346,27 @@ function renderMyCards() {
     if (inHand) btn.onclick = () => selectMyCard(n);
 
     if (isEven) evenRow.appendChild(btn);
-    else oddRow.appendChild(btn);
+    else         oddRow.appendChild(btn);
   });
 
   container.appendChild(oddRow);
   container.appendChild(evenRow);
 }
 
-function _getWeightedCards(parity) {
-  const ok = _parityOk(parity);
-  const cardCounts = {};
-  let total = 0;
-
-  for (const state of possibleEnemyHands) {
-    const { hand, weight } = state;
-    for (const c of hand.filter(ok)) {
-      cardCounts[c] = (cardCounts[c] || 0) + weight;
-      total += weight;
-    }
-  }
-
-  return { cardCounts, total };
-}
-
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
   container.innerHTML = '';
 
-  const oddRow = document.createElement('div');
-  oddRow.className = 'cards-sub-row';
+  const oddRow  = document.createElement('div');
+  oddRow.className  = 'cards-sub-row';
   const evenRow = document.createElement('div');
   evenRow.className = 'cards-sub-row';
 
-  const { cardCounts, total } = _getWeightedCards(selectedEnemy);
+  const dist = getEnemyDist(selectedEnemy);
 
   ALL_CARDS.forEach(n => {
-    const isEven = n % 2 === 0;
-    const count = cardCounts[n] || 0;
-    const chance = total > 0 ? Math.round((count / total) * 100) : 0;
+    const isEven  = n % 2 === 0;
+    const chance  = Math.round(dist[n] * 100);
     const possible = chance > 0;
 
     const slot = document.createElement('div');
@@ -706,38 +383,31 @@ function renderEnemyCards() {
     if (possible) {
       const chanceDiv = document.createElement('div');
       chanceDiv.className = 'enemy-chance';
-      if (chance === 100) chanceDiv.classList.add('sure-chance');
-      else if (chance >= 70) chanceDiv.classList.add('high-chance');
-      else if (chance <= 30) chanceDiv.classList.add('low-chance');
+      if (chance === 100)     chanceDiv.classList.add('sure-chance');
+      else if (chance >= 70)  chanceDiv.classList.add('high-chance');
+      else if (chance <= 30)  chanceDiv.classList.add('low-chance');
       chanceDiv.textContent = chance + '%';
       slot.appendChild(chanceDiv);
     }
 
     if (isEven) evenRow.appendChild(slot);
-    else oddRow.appendChild(slot);
+    else         oddRow.appendChild(slot);
   });
 
   container.appendChild(oddRow);
   container.appendChild(evenRow);
 
-  const uniqueCount = Object.keys(cardCounts).filter(k => cardCounts[k] > 0).length;
-  const minHandSize = Math.min(...possibleEnemyHands.map(s => s.hand.length));
-  const maxHandSize = Math.max(...possibleEnemyHands.map(s => s.hand.length));
-  const handSizeLabel = minHandSize === maxHandSize ? `${minHandSize} lap` : `${minHandSize}–${maxHandSize} lap`;
-
+  const possibleCount = dist.filter(v => v > 0).length;
   const countEl = document.getElementById('enemyCount');
   if (countEl) {
-    const parityLabel = selectedEnemy === 'even'
-      ? ' · páros szűrő'
-      : selectedEnemy === 'odd'
-        ? ' · páratlan szűrő'
-        : '';
-    countEl.textContent = `Kézben: ${handSizeLabel} · ${uniqueCount} féle lap lehetséges${parityLabel}`;
+    const pLabel = selectedEnemy === 'even' ? ' · páros szűrő'
+                 : selectedEnemy === 'odd'  ? ' · páratlan szűrő' : '';
+    countEl.textContent = `Lehetséges: ${possibleCount} / 9${pLabel}`;
   }
 
   const comboEl = document.getElementById('comboCount');
   if (comboEl) {
-    comboEl.textContent = `Ellenfél lehetséges kombinációi: ${possibleEnemyHands.length}`;
+    comboEl.textContent = `Ismert eloszlás alapján ${possibleCount} lap lehetséges`;
   }
 }
 
@@ -750,86 +420,61 @@ function renderOracle() {
     return;
   }
 
-  if (!_lastEVListReady) {
-    body.innerHTML = `
-      <div class="oracle-text">
-        <div class="oracle-main-text" style="text-align:center;padding:12px 0;">
-          <span style="font-size:18px;">⏳</span><br>
-          <span style="font-size:11px;color:var(--text-dim);">Számítás folyamatban…</span>
-        </div>
-      </div>`;
-    return;
-  }
+  const evs = getAllCardEVs(selectedEnemy);
+  if (evs.length === 0) return;
 
-  if (!iStarted && selectedEnemy === null) {
-    body.innerHTML = `
-      <div class="oracle-text">
-        <div class="oracle-main-text">
-          ⏳ <strong>Várakozás...</strong><br>
-          <span style="font-size:10px;color:var(--text-dim);">
-            Az ellenfél lerakta a lapját.<br>
-            Kattints a <strong>⬛ Páros</strong> vagy <strong>⬜ Páratlan</strong> gombra a hátlap alapján!
-          </span>
-        </div>
-      </div>`;
-    return;
-  }
+  const shown = selectedMine !== null
+    ? (evs.find(x => x.card === selectedMine) || evs[0])
+    : evs[0];
 
-  const evList = getAllCardEVs();
-  if (evList.length === 0) return;
-
-  const suggestedCard = selectedMine !== null ? selectedMine : evList[0].card;
-  const shown = evList.find(x => x.card === suggestedCard) || evList[0];
-  const { ev, win, lose, draw } = shown;
-  const isEven = suggestedCard % 2 === 0;
+  const { card, ev, win, lose, draw } = shown;
+  const isEven = card % 2 === 0;
   const diff = myScore - enemyScore;
   const remaining = myCards.length;
 
-  let strategyDesc = '';
-  const evIsApprox = iStarted && selectedEnemy === null;
+  // Stratégia szöveg
+  let stratText = '';
+  const parLabel = selectedEnemy === 'even' ? 'PÁROS' : selectedEnemy === 'odd' ? 'PÁRATLAN' : '?';
 
-  if (iStarted) {
-    const approxNote = evIsApprox
-      ? ` <span style="font-size:9px;color:var(--gold-light);opacity:0.8;">(paritás nélkül becsült)</span>`
-      : '';
-
+  if (selectedEnemy === null) {
+    stratText = `🎭 <strong>Paritást még nem adtál meg.</strong> Válaszd ki az ellenfél lapjának paritását a pontos javaslathoz.`;
+  } else if (iStarted) {
     if (win <= 20) {
-      strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${suggestedCard}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot ellene. Várható végpont: <strong>${ev.toFixed(2)}</strong>.${approxNote}`;
+      stratText = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${card}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot. EV: <strong>${ev.toFixed(2)}</strong>.`;
     } else if (diff >= 2 && remaining <= 4) {
-      strategyDesc = `🛡️ <strong>ELŐNY TARTÁSA:</strong> Vezetsz +${diff}-vel. A <strong>${suggestedCard}</strong>-es minimalizálja a kockázatot (EV: <strong>${ev.toFixed(2)}</strong>).${approxNote}`;
+      stratText = `🛡️ <strong>ELŐNY TARTÁSA:</strong> Vezetsz +${diff}-vel. A <strong>${card}</strong>-es minimalizálja a kockázatot (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else if (diff <= -2 && remaining <= 4) {
-      strategyDesc = `⚡ <strong>FORDÍTÁS KELL:</strong> Lemaradsz! A <strong>${suggestedCard}</strong>-es adja a legjobb fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).${approxNote}`;
+      stratText = `⚡ <strong>FORDÍTÁS KELL:</strong> Lemaradsz! A <strong>${card}</strong>-es adja a legjobb fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else {
-      strategyDesc = `🎭 <strong>VAK NYITÁS:</strong> Nem látjuk az ellenfél hátlapját. A <strong>${suggestedCard}</strong>-es a legjobb várható végpontot adja (<strong>${ev.toFixed(2)}</strong>).${approxNote}`;
+      stratText = `🎭 <strong>VAK NYITÁS (${parLabel}):</strong> A <strong>${card}</strong>-es a legjobb várható végpontot adja (EV: <strong>${ev.toFixed(2)}</strong>).`;
     }
   } else {
-    const parityLabel = selectedEnemy === 'even' ? 'PÁROS' : 'PÁRATLAN';
     if (win >= 80) {
-      strategyDesc = `🔥 <strong>BIZTOS PONT:</strong> Az ellenfél ${parityLabel} lapja ellen a <strong>${suggestedCard}</strong>-es <strong>${win}%</strong> eséllyel nyer. EV: <strong>${ev.toFixed(2)}</strong>.`;
+      stratText = `🔥 <strong>BIZTOS PONT:</strong> ${parLabel} ellen a <strong>${card}</strong>-es <strong>${win}%</strong> eséllyel nyer. EV: <strong>${ev.toFixed(2)}</strong>.`;
     } else if (win >= 50) {
-      strategyDesc = `⚔️ <strong>ELŐNYÖS:</strong> ${parityLabel} ellen a <strong>${suggestedCard}</strong>-es <strong>${win}%</strong> nyerési eséllyel a legjobb végpontot adja (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      stratText = `⚔️ <strong>ELŐNYÖS:</strong> ${parLabel} ellen a <strong>${card}</strong>-es <strong>${win}%</strong> nyerési eséllyel a legjobb (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else if (diff >= 2 && remaining <= 3) {
-      strategyDesc = `🛡️ <strong>VÉDEKEZÉS:</strong> Vezetsz +${diff}-vel, ${remaining} kör van hátra. A <strong>${suggestedCard}</strong>-es óvja az előnyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      stratText = `🛡️ <strong>VÉDEKEZÉS:</strong> Vezetsz +${diff}-vel, ${remaining} kör van hátra. A <strong>${card}</strong>-es óvja az előnyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else if (diff <= -2 && remaining <= 4) {
-      strategyDesc = `⚡ <strong>VISSZATÁMADÁS:</strong> Lemaradsz ${Math.abs(diff)}-vel! A <strong>${suggestedCard}</strong>-es a maximális fordulási esélyt adja (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      stratText = `⚡ <strong>VISSZATÁMADÁS:</strong> Lemaradsz ${Math.abs(diff)}-vel! A <strong>${card}</strong>-es adja a maximális fordulási esélyt (EV: <strong>${ev.toFixed(2)}</strong>).`;
     } else {
-      strategyDesc = `⚖️ <strong>OPTIMÁLIS:</strong> ${parityLabel} ellen a <strong>${suggestedCard}</strong>-es a teljes meccsre számított legjobb választás (EV: <strong>${ev.toFixed(2)}</strong>).`;
+      stratText = `⚖️ <strong>OPTIMÁLIS (${parLabel}):</strong> A <strong>${card}</strong>-es a teljes meccsre számított legjobb választás (EV: <strong>${ev.toFixed(2)}</strong>).`;
     }
   }
 
   const winColor = win >= 60 ? 'stat-val-green' : win >= 35 ? 'stat-val-gold' : 'stat-val-red';
-  const top4 = evList.slice(0, 4);
-  const maxEV = evList[0].ev;
+  const top4 = evs.slice(0, 4);
+  const maxEV = evs[0].ev;
 
   body.innerHTML = `
     <div class="oracle-suggestion">
       <div>
         <div class="oracle-card ${isEven ? 'oracle-even' : 'oracle-odd'}"
-             style="${!isEven ? 'color:#1a1400;' : ''}">${suggestedCard}</div>
+             style="${!isEven ? 'color:#1a1400;' : ''}">${card}</div>
       </div>
     </div>
     <div class="oracle-text">
-      <div class="oracle-main-text" style="font-size:11.5px;">${strategyDesc}</div>
+      <div class="oracle-main-text" style="font-size:11.5px;">${stratText}</div>
     </div>
     <div class="oracle-stats">
       <div class="oracle-stat-row">
@@ -837,7 +482,7 @@ function renderOracle() {
         <span class="stat-val-green" style="font-weight:700;">${ev.toFixed(2)}</span>
       </div>
       <div class="oracle-stat-row">
-        <span class="stat-label">Nyerési esély (kör)${evIsApprox ? ' ≈' : ''}</span>
+        <span class="stat-label">Nyerési esély (kör)</span>
         <span class="${winColor}">${win}%</span>
       </div>
       <div class="oracle-stat-row">
@@ -850,10 +495,10 @@ function renderOracle() {
       </div>
       <div style="height:1px;background:var(--border);margin:6px 0;"></div>
       <div style="font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--text-dim);margin-bottom:4px;">
-        EV RANGSOR — teljes meccs várható végpontja
+        EV RANGSOR
       </div>
       ${top4.map(item => {
-        const isSel = item.card === suggestedCard;
+        const isSel   = item.card === card;
         const itemEven = item.card % 2 === 0;
         const barW = maxEV > 0 ? Math.max(4, Math.round((item.ev / maxEV) * 60)) : 4;
         return `
@@ -876,46 +521,20 @@ function renderOracle() {
     </div>`;
 }
 
-// ============================================================================
-//  HANDLERS
-// ============================================================================
+function renderActionButtons() {
+  const av = getResultAvailability();
 
-function selectMyCard(n) {
-  if (!myCards.includes(n)) return;
-  if (selectedMine === n) {
-    _cardManuallySelected = false;
-    autoSelectOracleCard();
-  } else {
-    selectedMine = n;
-    _cardManuallySelected = true;
+  document.getElementById('btnWin').disabled  = !av.win;
+  document.getElementById('btnLose').disabled = !av.lose;
+  document.getElementById('btnDraw').disabled = !av.draw;
+
+  // Ha a jelenlegi selectedResult érvénytelen lett, töröljük
+  if (selectedResult && !av[selectedResult]) {
+    selectedResult = null;
+    document.getElementById('btnWin').classList.remove('active');
+    document.getElementById('btnLose').classList.remove('active');
+    document.getElementById('btnDraw').classList.remove('active');
   }
-  _lastRenderState = null;
-  _refreshUI();
-}
-
-function selectEnemyType(type) {
-  selectedEnemy = selectedEnemy === type ? null : type;
-  document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
-  document.getElementById('btnOdd').classList.toggle('active', selectedEnemy === 'odd');
-
-  _invalidateEVCache();
-  _requestEVComputation();
-
-  _lastRenderState = null;
-  _refreshUI();
-}
-
-function selectResult(res) {
-  const av = _getResultAvailability();
-  if (!av[res]) return;
-
-  selectedResult = selectedResult === res ? null : res;
-  document.getElementById('btnWin').classList.toggle('active', selectedResult === 'win');
-  document.getElementById('btnLose').classList.toggle('active', selectedResult === 'lose');
-  document.getElementById('btnDraw').classList.toggle('active', selectedResult === 'draw');
-
-  updateChips();
-  updateConfirmBtn();
 }
 
 function updateChips() {
@@ -924,7 +543,7 @@ function updateChips() {
   const cr = document.getElementById('chip-result');
 
   cm.textContent = selectedMine !== null ? `Lapom: ${selectedMine}` : 'Lapom: —';
-  cm.className = selectedMine !== null ? 'status-chip chip-mine' : 'status-chip chip-none';
+  cm.className   = selectedMine !== null ? 'status-chip chip-mine' : 'status-chip chip-none';
 
   ce.textContent = selectedEnemy
     ? (selectedEnemy === 'even' ? 'Ellenfél: Páros ⬛' : 'Ellenfél: Páratlan ⬜')
@@ -933,40 +552,34 @@ function updateChips() {
 
   if (selectedResult) {
     const labels = { win: 'Nyertem ✦', lose: 'Vesztettem ✧', draw: 'Döntetlen ◈' };
-    const cls = { win: 'chip-result-win', lose: 'chip-result-lose', draw: 'chip-result-draw' };
+    const cls    = { win: 'chip-result-win', lose: 'chip-result-lose', draw: 'chip-result-draw' };
     cr.textContent = `Eredmény: ${labels[selectedResult]}`;
-    cr.className = `status-chip ${cls[selectedResult]}`;
+    cr.className   = `status-chip ${cls[selectedResult]}`;
   } else {
     cr.textContent = 'Eredmény: —';
-    cr.className = 'status-chip chip-none';
+    cr.className   = 'status-chip chip-none';
   }
 }
 
 function updateConfirmBtn() {
-  const btn = document.getElementById('btnConfirm');
+  const btn  = document.getElementById('btnConfirm');
   const hint = document.getElementById('confirmHint');
 
-  const av = _getResultAvailability();
-  const resultValid = selectedResult && av[selectedResult];
-
+  const av = getResultAvailability();
   const canConfirm =
-    selectedMine !== null &&
-    selectedEnemy !== null &&
-    resultValid &&
-    !isConfirming;
+    selectedMine   !== null &&
+    selectedEnemy  !== null &&
+    selectedResult !== null &&
+    av[selectedResult];
 
   btn.disabled = !canConfirm;
 
   if (!hint) return;
 
-  if (!iStarted && selectedEnemy === null) {
-    hint.textContent = '⬛⬜ Nézd meg az ellenfél hátlapját, kattints Páros/Páratlan!';
-  } else if (iStarted && selectedMine === null) {
-    hint.textContent = '🃏 Nézd meg az Oracle javaslatát, válaszd ki a lapot!';
-  } else if (selectedEnemy === null) {
+  if (selectedEnemy === null) {
     hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását!';
   } else if (selectedMine === null) {
-    hint.textContent = '🃏 Válaszd ki a javasolt lapot (vagy más lapot)!';
+    hint.textContent = '🃏 Válassz lapot (vagy fogadd el az Oracle javaslatát)!';
   } else if (!selectedResult) {
     hint.textContent = '🎯 Add meg a kör eredményét!';
   } else if (canConfirm) {
@@ -976,68 +589,101 @@ function updateConfirmBtn() {
   }
 }
 
+// ============================================================
+//  EVENT HANDLEREK
+// ============================================================
+
+function selectMyCard(n) {
+  if (!myCards.includes(n)) return;
+  selectedMine = n;
+  refreshAll();
+}
+
+function selectEnemyType(type) {
+  selectedEnemy = selectedEnemy === type ? null : type;
+  document.getElementById('btnEven').classList.toggle('active', selectedEnemy === 'even');
+  document.getElementById('btnOdd').classList.toggle('active',  selectedEnemy === 'odd');
+
+  // Oracle auto-select az új paritás alapján
+  autoSelectCard();
+  refreshAll();
+}
+
+function selectResult(res) {
+  const av = getResultAvailability();
+  if (!av[res]) return;
+
+  selectedResult = selectedResult === res ? null : res;
+  document.getElementById('btnWin').classList.toggle('active',  selectedResult === 'win');
+  document.getElementById('btnLose').classList.toggle('active', selectedResult === 'lose');
+  document.getElementById('btnDraw').classList.toggle('active', selectedResult === 'draw');
+
+  updateChips();
+  updateConfirmBtn();
+}
+
 function confirmRound() {
+  const av = getResultAvailability();
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
-  if (isConfirming) return;
+  if (!av[selectedResult]) return;
 
-  isConfirming = true;
-  const confirmBtn = document.getElementById('btnConfirm');
-  if (confirmBtn) {
-    confirmBtn.disabled = true;
-    confirmBtn.textContent = '⏳ Rögzítés...';
-  }
-
+  // Snapshot mentése undo-hoz
   history.push({
-    myCards: [...myCards],
-    possibleEnemyHands: possibleEnemyHands.map(s => ({ hand: [...s.hand], weight: s.weight })),
+    myCards:      [...myCards],
+    enemyProb:    [...enemyProb],
     myScore,
     enemyScore,
+    roundNum,
+    iStarted,
     selectedMine,
     selectedEnemy,
-    selectedResult,
-    iStarted,
-    roundNum
+    selectedResult
   });
 
-  if (selectedResult === 'win') myScore++;
+  // Pontszám frissítés
+  if (selectedResult === 'win')  myScore++;
   else if (selectedResult === 'lose') enemyScore++;
 
-  possibleEnemyHands = deduceEnemyHands(selectedMine, selectedEnemy, selectedResult);
+  // Ellenfél modell frissítése
+  updateEnemyProb(selectedMine, selectedEnemy, selectedResult);
+
+  // Saját lap eltávolítása
   myCards = myCards.filter(c => c !== selectedMine);
 
-  const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
-  const enemyLabel = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜') + (iStarted ? ' (én kezdtem)' : '');
-  const resultClass = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[selectedResult];
-
+  // Napló bejegyzés
+  const labels    = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+  const cls       = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' };
+  const parLabel  = (selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
+                  + (iStarted ? ' (én)' : '');
   roundNum++;
-  addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
+  addHistoryEntry(roundNum, selectedMine, parLabel, labels[selectedResult], cls[selectedResult]);
 
+  // Első kör után toggle letiltása
   if (roundNum === 1) {
     const chk = document.getElementById('chkIStart');
     if (chk) chk.disabled = true;
   }
 
-  selectedMine = null;
+  // Reset kör állapot
+  selectedMine   = null;
+  selectedEnemy  = null;
   selectedResult = null;
-  selectedEnemy = null;
-  _cardManuallySelected = false;
+  clearAllActive();
 
-  clearActionButtons();
-
-  _lastRenderState = null;
-  _requestEVComputation();
-
-  setTimeout(() => {
-    isConfirming = false;
-    if (confirmBtn) confirmBtn.textContent = '✦ Rögzítés';
-    updateScoreBoard();
-    _refreshUI();
-  }, 0);
+  // Auto-select következő körre
+  autoSelectCard();
+  refreshAll();
 }
+
+// ============================================================
+//  HISTORY
+// ============================================================
 
 function addHistoryEntry(round, mine, enemy, result, cls) {
   const list = document.getElementById('historyList');
-  if (list.querySelector('.history-empty')) list.innerHTML = '';
+  const empty = list.querySelector('.history-empty');
+  if (empty) list.innerHTML = '';
+
   const entry = document.createElement('div');
   entry.className = 'history-entry';
   entry.innerHTML = `<span class="h-round">#${round}</span> <span class="h-mine">Én: ${mine}</span> <span class="h-enemy">Ell: ${enemy}</span> <span class="${cls}">${result}</span>`;
@@ -1052,79 +698,91 @@ function renderHistory() {
     return;
   }
   history.forEach((h, i) => {
-    const labels = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
-    const cls = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[h.selectedResult];
-    const enemyLabel = (h.selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜') + (h.iStarted ? ' (én kezdtem)' : '');
-    addHistoryEntry(i + 1, h.selectedMine, enemyLabel, labels[h.selectedResult], cls);
+    const labels   = { win: 'Nyertem', lose: 'Vesztettem', draw: 'Döntetlen' };
+    const cls      = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' };
+    const parLabel = (h.selectedEnemy === 'even' ? 'Páros ⬛' : 'Páratlan ⬜')
+                   + (h.iStarted ? ' (én)' : '');
+    addHistoryEntry(i + 1, h.selectedMine, parLabel, labels[h.selectedResult], cls[h.selectedResult]);
   });
 }
+
+// ============================================================
+//  UNDO / RESET
+// ============================================================
 
 function undoLast() {
   if (history.length === 0) return;
   const snap = history.pop();
-  myCards = snap.myCards;
-  possibleEnemyHands = snap.possibleEnemyHands;
-  myScore = snap.myScore;
+
+  myCards    = snap.myCards;
+  enemyProb  = snap.enemyProb;
+  myScore    = snap.myScore;
   enemyScore = snap.enemyScore;
-  roundNum = snap.roundNum;
+  roundNum   = snap.roundNum;
+  iStarted   = snap.iStarted;
 
-  iStarted = snap.iStarted;
-  const chkUndo = document.getElementById('chkIStart');
-  if (chkUndo) {
-    chkUndo.checked = iStarted;
-    if (snap.roundNum === 0) chkUndo.disabled = false;
-  }
-
-  selectedMine = null;
-  selectedEnemy = null;
+  selectedMine   = null;
+  selectedEnemy  = null;
   selectedResult = null;
-  _cardManuallySelected = false;
-  clearActionButtons();
-
-  _invalidateEVCache();
-  _lastRenderState = null;
-
-  _requestEVComputation();
-  updateScoreBoard();
-  renderHistory();
-  _refreshUI();
-}
-
-function resetAll() {
-  myCards = [...ALL_CARDS];
-  possibleEnemyHands = [{ hand: [...ALL_CARDS], weight: 1 }];
-  history = [];
-  roundNum = 0;
-  myScore = 0;
-  enemyScore = 0;
-  selectedMine = null;
-  selectedEnemy = null;
-  selectedResult = null;
-  isConfirming = false;
-  _cardManuallySelected = false;
+  clearAllActive();
 
   const chk = document.getElementById('chkIStart');
   if (chk) {
-    chk.checked = false;
-    chk.disabled = false;
+    chk.checked  = iStarted;
+    chk.disabled = snap.roundNum === 0 ? false : true;
+    document.getElementById('toggleText').textContent = iStarted ? 'Én kezdem' : 'Ellenfél kezd';
   }
-  iStarted = false;
 
-  clearActionButtons();
-  _invalidateEVCache();
-  _lastRenderState = null;
-
-  _requestEVComputation();
-  updateScoreBoard();
-  _refreshUI();
+  autoSelectCard();
   renderHistory();
+  refreshAll();
 }
 
-function clearActionButtons() {
+function resetAll() {
+  myCards    = [...ALL_CARDS];
+  enemyProb  = new Array(9).fill(1.0);
+  myScore    = 0;
+  enemyScore = 0;
+  roundNum   = 0;
+  history    = [];
+
+  selectedMine   = null;
+  selectedEnemy  = null;
+  selectedResult = null;
+  iStarted       = false;
+  clearAllActive();
+
+  const chk = document.getElementById('chkIStart');
+  if (chk) {
+    chk.checked  = false;
+    chk.disabled = false;
+    document.getElementById('toggleText').textContent = 'Ellenfél kezd';
+  }
+
+  autoSelectCard();
+  renderHistory();
+  refreshAll();
+}
+
+// ============================================================
+//  SEGÉD
+// ============================================================
+
+function clearAllActive() {
   ['btnEven', 'btnOdd', 'btnWin', 'btnLose', 'btnDraw'].forEach(id =>
     document.getElementById(id).classList.remove('active')
   );
 }
+
+function clearPairityActive() {
+  ['btnEven', 'btnOdd'].forEach(id =>
+    document.getElementById(id).classList.remove('active')
+  );
+}
+
+// ============================================================
+//  KEYBOARD SHORTCUTS
+// ============================================================
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') {
@@ -1135,5 +793,9 @@ document.addEventListener('keydown', e => {
     undoLast();
   }
 });
+
+// ============================================================
+//  START
+// ============================================================
 
 init();
