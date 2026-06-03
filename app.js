@@ -112,20 +112,19 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// [FIX] getAllCardEVs: minden lehetséges ellenfél kézre külön _computeEV hívás,
-// majd súlyozott átlag — így a rekurzió is a helyes (kézspecifikus) maszkkal dolgozik,
-// nem az összes lehetséges lap uniójával. Ez javítja az egyforma EV problémát.
+// [FIX2] getAllCardEVs: win/lose/draw százalékok is a pairs lista alapján számolódnak
+// — így paritás nélkül is a possibleEnemyHands szűkítését tükrözi,
+// nem egyforma eloszlást feltételez minden megmaradt ellenfél lapra.
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
   if (_lastEVList) return _lastEVList;
 
   const ok = _parityOk(selectedEnemy);
-  const { cardCounts, total } = _getWeightedCards(selectedEnemy);
   const losePrefer = myScore < enemyScore;
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  // Minden (kéz, ellenfél lap) pár amit figyelembe veszünk
-  // Súly = 1 per pár, összesen = total
+  // Minden (kéz, ellenfél lap) pár — súly = 1 per pár
+  // Ez alapján számolódik az EV és a win/lose/draw is
   const pairs = [];
   for (const hand of possibleEnemyHands) {
     const handMask = hand.reduce((m, c) => m | (1 << c), 0);
@@ -135,34 +134,31 @@ function getAllCardEVs() {
     }
   }
 
+  const pairsLen = pairs.length;
+
   _lastEVList = myCards.map(myCard => {
     const nextMyMask = nextMyBase ^ (1 << myCard);
     let totalEV = 0;
+    let w = 0, l = 0, d = 0;
 
-    if (pairs.length === 0) {
+    if (pairsLen === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      // Minden (ec, futureMask) párra külön _computeEV — helyes kézspecifikus maszk
+      // Minden (ec, futureMask) párra külön _computeEV és win/lose/draw számítás
       for (const { ec, futureMask } of pairs) {
         let nm = myScore, ne = enemyScore;
-        if (myCard > ec) nm++; else if (myCard < ec) ne++;
+        if (myCard > ec) { nm++; w++; }
+        else if (myCard < ec) { ne++; l++; }
+        else { d++; } // döntetlen: pontszám nem változik ebben a körben
         const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
         totalEV += subEV;
       }
-      totalEV /= pairs.length;
+      totalEV /= pairsLen;
     }
 
-    let w = 0, l = 0, d = 0;
-    for (const [ecStr, weight] of Object.entries(cardCounts)) {
-      const ec = parseInt(ecStr);
-      if (myCard > ec) w += weight;
-      else if (myCard < ec) l += weight;
-      else d += weight;
-    }
-
-    const win  = total > 0 ? Math.round(w / total * 100) : 0;
-    const lose = total > 0 ? Math.round(l / total * 100) : 0;
-    const draw = total > 0 ? Math.round(d / total * 100) : 0;
+    const win  = pairsLen > 0 ? Math.round(w / pairsLen * 100) : 0;
+    const lose = pairsLen > 0 ? Math.round(l / pairsLen * 100) : 0;
+    const draw = pairsLen > 0 ? Math.round(d / pairsLen * 100) : 0;
 
     return { card: myCard, ev: totalEV, win, lose, draw };
   }).sort((a, b) =>
