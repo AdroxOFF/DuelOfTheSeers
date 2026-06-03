@@ -442,6 +442,11 @@ function renderEnemyCards() {
                       : '';
     countEl.textContent = `Lehetséges: ${uniqueCount} / 9${parityLabel}`;
   }
+
+  const comboEl = document.getElementById('comboCount');
+  if (comboEl) {
+    comboEl.textContent = `Ellenfél lehetséges kombinációi: ${possibleEnemyHands.length}`;
+  }
 }
 
 // =============================================
