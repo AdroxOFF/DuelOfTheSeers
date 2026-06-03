@@ -1,24 +1,35 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v8.0
+//  app.js v9.0
 // =============================================
 //
-//  JAVÍTÁSOK v7.0 → v8.0:
-//  [BUG8]  deduceEnemyHands: .sort() visszarakva — nélküle azonos kezek
-//          különböző stringként duplikálódtak a Set-ben, torzítva a dedukciót
-//  [BUG9]  updateConfirmBtn hint sorrend javítva: iStarted módban előbb
-//          kérje a paritást, utána a lapot (fordított sorrend volt)
-//  [BUG10] _finalScore: döntetlen esetén 0 helyett myS-t ad vissza,
-//          mivel a játékban döntetlen esetén az alappont jár, nem 0
-//          (ha a játék másként pontozza, itt kell módosítani)
-//  [CLEAN] getAllCardEVs: ecToHands építés és _getWeightedCards duplikált
-//          parityOk logikája összevonva — egyetlen forrás
+//  JAVÍTÁSOK v8.0 → v9.0:
+//  [BAY1]  possibleEnemyHands: [{hand, weight}] formátumra váltva.
+//          Minden állapot hordozza a saját Bayes-es súlyát.
+//  [BAY2]  deduceEnemyHands(): Bayes-es frissítés.
+//          Minden (state × kandidált lap) párhoz weight = state.weight * playProb,
+//          ahol playProb = 1 / candidates.length. Ez megakadályozza, hogy egy
+//          állapot háromszorosan számolódjon, ha 3 kandidált lapja van.
+//  [BAY3]  normalizeWeights() + mergeEquivalentHands() bevezetve.
+//          Azonos kezek összevonásra kerülnek, súlyaik összeadódnak.
+//          Felváltja a régi .sort().join() alapú Set-deduplikációt (BUG8 fix).
+//  [BAY4]  _getWeightedCards(): weight-tel súlyoz darabszám helyett.
+//  [BAY5]  getAllCardEVs(): pairs lista weight = state.weight * playProb alapon
+//          épül. totalEV és w/l/d is pairWeight-tel súlyoz, totalWeight-tel oszt.
+//          Ez javítja a win%/lose%/draw% torzulását is (korábban minden pár
+//          egyforma súlyt kapott, most az állapot valószínűsége is beleszámít).
+//  [HOOK]  enemyPlayWeight(card): prior hook. Alapértelmezetten 1 (egyenletes),
+//          de felülírható heurisztikával (pl. 1/(card+1)) ha az ellenfél
+//          viselkedéséről van feltevésünk. Változtatáshoz csak ezt a függvényt
+//          kell módosítani, az összes többi logika automatikusan veszi figyelembe.
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
 
 let myCards            = [...ALL_CARDS];
-let possibleEnemyHands = [ [...ALL_CARDS] ];
+
+// [BAY1] Súlyozott állapotok: {hand: number[], weight: number}
+let possibleEnemyHands = [ { hand: [...ALL_CARDS], weight: 1 } ];
 
 let myScore    = 0;
 let enemyScore = 0;
@@ -34,6 +45,18 @@ let isConfirming = false;
 let _cardManuallySelected = false;
 
 // =============================================
+//  [HOOK] ELLENFÉL PRIOR — egyetlen helyen módosítandó
+// =============================================
+// Alapértelmezett: egyenletes (minden lap ugyanolyan valószínű).
+// Heurisztikus példák:
+//   return 1 / (card + 1);          // kisebb lapot ritkábban játszik ki
+//   return card + 1;                // nagyobb lapot preferálja
+//   return card < 4 ? 0.5 : 1.5;   // felső felét preferálja
+function enemyPlayWeight(card) {
+  return 1; // egyenletes prior — módosítsd ha ellenfél-modellt szeretnél
+}
+
+// =============================================
 //  EV MOTOR
 // =============================================
 let _evCache = new Map();
@@ -44,16 +67,10 @@ function _maskCount(m) {
   let n = 0; while (m) { n += m & 1; m >>= 1; } return n;
 }
 
-// Meccs végi pontszám számítása:
-// - Győzelem (d > 0): alappont + különbség bónusz (pl. 4-3 → 5)
-// - Döntetlen (d = 0): alappont jár (pl. 4-4 → 4)
-// - Vereség (d < 0): alappont jár, bónusz nincs (pl. 3-5 → 3)
-// Döntetlen és vereség ugyanannyi pontot ér az EV motor szempontjából,
-// ezért az oracle nem erőlteti feleslegesen a döntetlent veszítő állásban.
 function _finalScore(myS, enemyS) {
   const d = myS - enemyS;
   if (d > 0) return myS + d;
-  return myS; // döntetlen és vereség: csak az alappont jár
+  return myS;
 }
 
 function _computeEV(myMask, enemyMask, myS, enemyS) {
@@ -93,28 +110,28 @@ function _computeEV(myMask, enemyMask, myS, enemyS) {
   return r;
 }
 
-// [CLEAN] Egységes parityOk segédfüggvény — egyetlen forrás mindenhol
 function _parityOk(parity) {
   if (parity === 'even') return c => c % 2 === 0;
   if (parity === 'odd')  return c => c % 2 !== 0;
   return () => true;
 }
 
+// [BAY4] weight-tel súlyoz darabszám helyett
 function _getWeightedCards(parity) {
   const ok = _parityOk(parity);
   let cardCounts = {}, total = 0;
-  for (const hand of possibleEnemyHands) {
+  for (const state of possibleEnemyHands) {
+    const { hand, weight } = state;
     for (const c of hand.filter(ok)) {
-      cardCounts[c] = (cardCounts[c] || 0) + 1;
-      total++;
+      cardCounts[c] = (cardCounts[c] || 0) + weight;
+      total += weight;
     }
   }
   return { cardCounts, total };
 }
 
-// [FIX2] getAllCardEVs: win/lose/draw százalékok is a pairs lista alapján számolódnak
-// — így paritás nélkül is a possibleEnemyHands szűkítését tükrözi,
-// nem egyforma eloszlást feltételez minden megmaradt ellenfél lapra.
+// [BAY5] getAllCardEVs: pairs súlya state.weight * playProb,
+// win/lose/draw is pairWeight-tel súlyoz, totalWeight-tel oszt.
 function getAllCardEVs() {
   if (myCards.length === 0) return [];
   if (_lastEVList) return _lastEVList;
@@ -123,42 +140,50 @@ function getAllCardEVs() {
   const losePrefer = myScore < enemyScore;
   const nextMyBase = myCards.reduce((m, c) => m | (1 << c), 0);
 
-  // Minden (kéz, ellenfél lap) pár — súly = 1 per pár
-  // Ez alapján számolódik az EV és a win/lose/draw is
+  // [BAY5] Súlyozott pairs: weight = state.weight * playProb
   const pairs = [];
-  for (const hand of possibleEnemyHands) {
+  for (const state of possibleEnemyHands) {
+    const { hand, weight } = state;
     const handMask = hand.reduce((m, c) => m | (1 << c), 0);
-    for (const ec of hand.filter(ok)) {
+    const candidates = hand.filter(ok);
+    if (candidates.length === 0) continue;
+
+    // Prior-súlyozott jelöltek
+    const rawWeights = candidates.map(c => enemyPlayWeight(c));
+    const rawTotal   = rawWeights.reduce((s, w) => s + w, 0);
+
+    candidates.forEach((ec, i) => {
+      const playProb   = rawWeights[i] / rawTotal; // prior-súlyozott arány
+      const pairWeight = weight * playProb;
       const futureMask = handMask ^ (1 << ec);
-      pairs.push({ ec, futureMask });
-    }
+      pairs.push({ ec, futureMask, weight: pairWeight });
+    });
   }
 
-  const pairsLen = pairs.length;
+  const totalWeight = pairs.reduce((s, p) => s + p.weight, 0);
 
   _lastEVList = myCards.map(myCard => {
     const nextMyMask = nextMyBase ^ (1 << myCard);
     let totalEV = 0;
     let w = 0, l = 0, d = 0;
 
-    if (pairsLen === 0) {
+    if (pairs.length === 0 || totalWeight === 0) {
       totalEV = _finalScore(myScore, enemyScore);
     } else {
-      // Minden (ec, futureMask) párra külön _computeEV és win/lose/draw számítás
-      for (const { ec, futureMask } of pairs) {
+      for (const { ec, futureMask, weight: pairWeight } of pairs) {
         let nm = myScore, ne = enemyScore;
-        if (myCard > ec) { nm++; w++; }
-        else if (myCard < ec) { ne++; l++; }
-        else { d++; } // döntetlen: pontszám nem változik ebben a körben
+        if (myCard > ec)      { nm++; w += pairWeight; }
+        else if (myCard < ec) { ne++; l += pairWeight; }
+        else                  {       d += pairWeight; }
         const { ev: subEV } = _computeEV(nextMyMask, futureMask, nm, ne);
-        totalEV += subEV;
+        totalEV += subEV * pairWeight;
       }
-      totalEV /= pairsLen;
+      totalEV /= totalWeight;
     }
 
-    const win  = pairsLen > 0 ? Math.round(w / pairsLen * 100) : 0;
-    const lose = pairsLen > 0 ? Math.round(l / pairsLen * 100) : 0;
-    const draw = pairsLen > 0 ? Math.round(d / pairsLen * 100) : 0;
+    const win  = totalWeight > 0 ? Math.round(w / totalWeight * 100) : 0;
+    const lose = totalWeight > 0 ? Math.round(l / totalWeight * 100) : 0;
+    const draw = totalWeight > 0 ? Math.round(d / totalWeight * 100) : 0;
 
     return { card: myCard, ev: totalEV, win, lose, draw };
   }).sort((a, b) =>
@@ -197,7 +222,6 @@ function _getResultAvailability() {
 
   const ok = _parityOk(selectedEnemy);
 
-  // Döntetlen csak ha a saját lap paritása egyezik az ellenfél paritásával
   if (!ok(selectedMine)) {
     availability.draw = false;
   }
@@ -205,8 +229,8 @@ function _getResultAvailability() {
   for (const res of ['win', 'lose', 'draw']) {
     if (!availability[res]) continue;
     let found = false;
-    for (const hand of possibleEnemyHands) {
-      let candidates = hand.filter(c => ok(c));
+    for (const state of possibleEnemyHands) {
+      let candidates = state.hand.filter(c => ok(c));
       if (res === 'win')       candidates = candidates.filter(c => c < selectedMine);
       else if (res === 'lose') candidates = candidates.filter(c => c > selectedMine);
       else if (res === 'draw') candidates = candidates.filter(c => c === selectedMine);
@@ -217,6 +241,67 @@ function _getResultAvailability() {
 
   _lastValidation = { key, result: availability };
   return availability;
+}
+
+// =============================================
+//  [BAY3] SÚLY-SEGÉDEK
+// =============================================
+function normalizeWeights(states) {
+  const total = states.reduce((s, x) => s + x.weight, 0);
+  if (total === 0) return;
+  for (const s of states) s.weight /= total;
+}
+
+function mergeEquivalentHands(states) {
+  const map = new Map();
+  for (const s of states) {
+    const key = s.hand.join(','); // hand már rendezett (sort a deduceban)
+    if (!map.has(key)) {
+      map.set(key, { hand: s.hand, weight: s.weight });
+    } else {
+      map.get(key).weight += s.weight;
+    }
+  }
+  return [...map.values()];
+}
+
+// =============================================
+//  [BAY2] DEDUKCIÓ — Bayes-es frissítés
+// =============================================
+function deduceEnemyHands(myCard, enemyType, result) {
+  const ok = _parityOk(enemyType);
+  const newStates = [];
+
+  for (const state of possibleEnemyHands) {
+    const { hand, weight } = state;
+
+    let candidates = hand.filter(c => ok(c));
+    if (result === 'win')       candidates = candidates.filter(c => c < myCard);
+    else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
+    else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
+
+    if (candidates.length === 0) continue;
+
+    // Prior-súlyozott valószínűség az egyes kandidáltakra
+    const rawWeights = candidates.map(c => enemyPlayWeight(c));
+    const rawTotal   = rawWeights.reduce((s, w) => s + w, 0);
+
+    candidates.forEach((playedCard, i) => {
+      const playProb = rawWeights[i] / rawTotal;
+      const newHand  = hand.filter(c => c !== playedCard).sort((a, b) => a - b);
+      newStates.push({
+        hand:   newHand,
+        weight: weight * playProb   // [BAY2] state.weight * playProb
+      });
+    });
+  }
+
+  if (newStates.length === 0) return possibleEnemyHands;
+
+  // [BAY3] Összevonás + normalizálás
+  const merged = mergeEquivalentHands(newStates);
+  normalizeWeights(merged);
+  return merged;
 }
 
 // =============================================
@@ -638,7 +723,6 @@ function updateChips() {
   }
 }
 
-// [BUG9] Javított hint sorrend: iStarted módban előbb paritást kér, utána lapot
 function updateConfirmBtn() {
   const btn  = document.getElementById('btnConfirm');
   const hint = document.getElementById('confirmHint');
@@ -656,13 +740,10 @@ function updateConfirmBtn() {
   if (!hint) return;
 
   if (!iStarted && selectedEnemy === null) {
-    // Ellenfél kezdett: előbb paritást kell megadni, majd a lap és eredmény
     hint.textContent = '⬛⬜ Nézd meg az ellenfél hátlapját, kattints Páros/Páratlan!';
   } else if (iStarted && selectedMine === null) {
-    // Te kezdtél: előbb az oracle alapján válaszd ki a lapot
     hint.textContent = '🃏 Nézd meg az Oracle javaslatát, válaszd ki a lapot!';
   } else if (selectedEnemy === null) {
-    // Te kezdtél és leraktad a lapot: most add meg az ellenfél paritását
     hint.textContent = '⬛⬜ Add meg az ellenfél lapjának paritását!';
   } else if (selectedMine === null) {
     hint.textContent = '🃏 Válaszd ki a javasolt lapot (vagy más lapot)!';
@@ -676,34 +757,6 @@ function updateConfirmBtn() {
 }
 
 // =============================================
-//  DEDUKCIÓS LOGIKA
-// =============================================
-// [BUG8] .sort() visszarakva — nélküle azonos kezek különböző stringként
-//        duplikálódhattak a Set-ben, ami torzította az ellenfél valószínűségeit
-function deduceEnemyHands(myCard, enemyType, result) {
-  const ok = _parityOk(enemyType);
-  let newHandsSet = new Set();
-
-  for (const hand of possibleEnemyHands) {
-    let candidates = hand.filter(c => ok(c));
-    if (result === 'win')       candidates = candidates.filter(c => c < myCard);
-    else if (result === 'lose') candidates = candidates.filter(c => c > myCard);
-    else if (result === 'draw') candidates = candidates.filter(c => c === myCard);
-
-    for (const c of candidates) {
-      // [BUG8] .sort() biztosítja hogy ugyanaz a kéz mindig ugyanaz a string legyen
-      newHandsSet.add(hand.filter(card => card !== c).sort((a, b) => a - b).join(','));
-    }
-  }
-
-  const newHands = [...newHandsSet].map(str =>
-    str === '' ? [] : str.split(',').map(Number)
-  );
-
-  return newHands.length > 0 ? newHands : possibleEnemyHands;
-}
-
-// =============================================
 //  CONFIRM ROUND
 // =============================================
 function confirmRound() {
@@ -714,9 +767,10 @@ function confirmRound() {
   const confirmBtn = document.getElementById('btnConfirm');
   if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = '⏳ Rögzítés...'; }
 
+  // Snapshot mentése undo-hoz — {hand, weight} formátum megőrzése
   history.push({
     myCards: [...myCards],
-    possibleEnemyHands: possibleEnemyHands.map(h => [...h]),
+    possibleEnemyHands: possibleEnemyHands.map(s => ({ hand: [...s.hand], weight: s.weight })),
     myScore, enemyScore, selectedMine, selectedEnemy, selectedResult, iStarted, roundNum
   });
 
@@ -734,8 +788,6 @@ function confirmRound() {
   roundNum++;
   addHistoryEntry(roundNum, selectedMine, enemyLabel, labels[selectedResult], resultClass);
 
-  // Az első kör után letiltjuk az iStarted checkboxot —
-  // ki kezd az egész meccsen ugyanaz, nem kell/szabad körönként változtatni
   if (roundNum === 1) {
     const chk = document.getElementById('chkIStart');
     if (chk) chk.disabled = true;
@@ -792,6 +844,7 @@ function undoLast() {
   if (history.length === 0) return;
   const snap = history.pop();
   myCards            = snap.myCards;
+  // [BAY1] {hand, weight} formátum visszaállítása
   possibleEnemyHands = snap.possibleEnemyHands;
   myScore            = snap.myScore;
   enemyScore         = snap.enemyScore;
@@ -801,7 +854,6 @@ function undoLast() {
   const chkUndo = document.getElementById('chkIStart');
   if (chkUndo) {
     chkUndo.checked = iStarted;
-    // Ha visszavontuk az első kört, a checkbox újra engedélyeződik
     if (snap.roundNum === 0) chkUndo.disabled = false;
   }
 
@@ -820,7 +872,8 @@ function undoLast() {
 
 function resetAll() {
   myCards = [...ALL_CARDS];
-  possibleEnemyHands = [ [...ALL_CARDS] ];
+  // [BAY1] Visszaállítás súlyozott formátumba
+  possibleEnemyHands = [ { hand: [...ALL_CARDS], weight: 1 } ];
   history = []; roundNum = 0;
   myScore = 0; enemyScore = 0;
   selectedMine = null; selectedEnemy = null; selectedResult = null;
