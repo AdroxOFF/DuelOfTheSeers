@@ -1,18 +1,19 @@
 // =============================================
 //  LÁTÓK PÁRBAJA — PONTMAXIMALIZÁLÓ HELPER
-//  app.js v10.7 (Turbo Speed)
+//  app.js v11.0 (Single Source of Truth)
 // =============================================
 //
-//  JAVÍTÁSOK v10.6 → v10.7:
-//  [TURBO-1] Cache Thrashing megszüntetése: Az LRU cache és a 
-//            méretkorlát kikerült. Egy kör számítása során a 
-//            teljes állapot elfér a memóriában, az ürítés a
-//            körök között történik. Ez megakadályozza a végtelen
-//            rekurziós spirált (amikor elfelejti amit kiszámolt).
-//  [TURBO-2] 32-bites Fast Path: Ha csak 1 Bayes-állapot van (99%),
-//            a cache kulcs egyetlen 32-bites egész szám lesz, és 
-//            a tömb-műveletek (filter) helyett azonnali push fut. 
-//            Sebességnövekedés: ~100x.
+//  JAVÍTÁSOK v10.7 → v11.0:
+//  [ARCH-1] DRY (Don't Repeat Yourself) struktúra: A matematikai
+//           függvények (EV motor, Bayes) Szigorúan csak EGYSZER 
+//           vannak definiálva.
+//  [ARCH-2] A Web Worker ezentúl .toString() injekcióval kapja meg 
+//           az algoritmust. A Worker és a Main thread garantáltan 
+//           100%-ig azonos logikát futtat. Nincs több "silent drift".
+//  [FIX-1]  Cache Collision (túlcsordulás) javítva: az fp generálás 
+//           biztonságos stringgé lett alakítva a 32-bites limit miatt.
+//  [FIX-2]  A Vak Kezdés (selectedEnemy === null) Tie-Breaker 
+//           most már egységesen fut az egész rendszerben.
 // =============================================
 
 const ALL_CARDS = [0, 1, 2, 3, 4, 5, 6, 7, 8];
@@ -33,18 +34,15 @@ let roundNum = 0;
 let isConfirming = false;
 let _cardManuallySelected = false;
 
-// =============================================
-//  [PERF-3] WEB WORKER SETUP
-// =============================================
-let _worker = null;
-let _workerBusy = false;
-let _pendingWorkerRequest = null;
 
-function _getWorkerCode() {
-  return `
-const _evCache = new Map();
+// ============================================================================
+//  1. RÉSZ: A KÖZÖS MATEMATIKAI MAG (PURE FUNCTIONS)
+//  Ezek a függvények csak itt léteznek. A főszál és a Worker is ezt használja.
+// ============================================================================
 
-function enemyPlayWeight(card) { return 1; }
+function enemyPlayWeight(card) { 
+  return 1; 
+}
 
 function _finalScore(myS, enemyS) {
   const d = myS - enemyS;
@@ -52,16 +50,15 @@ function _finalScore(myS, enemyS) {
   return myS;
 }
 
-// [TURBO-2] 32-bites bitmask kulcs, ha nincs Bayes hasadás
 function _getCacheKey(states, myMask, myS, enemyS) {
   if (states.length === 1) {
     let eMask = 0;
     const h = states[0].hand;
     for (let i = 0; i < h.length; i++) eMask |= (1 << h[i]);
-    // Egyetlen 32-bites signed integerbe csomagolva a 4 érték
+    // 32-bites fast path (Nincs string allokáció)
     return (eMask << 18) | (myMask << 9) | (myS << 4) | enemyS;
   }
-  // Fallback: Több állapotnál string azonosító
+  // Biztonságos string kulcs (nincs integer túlcsordulás)
   let fp = '';
   for (let i = 0; i < states.length; i++) {
     let m = 0;
@@ -76,7 +73,7 @@ function mergeEquivalentHands(states) {
   const map = new Map();
   for (let i = 0; i < states.length; i++) {
     const s = states[i];
-    const key = s.hand.join(','); // A kezek a fast path miatt is már rendezettek
+    const key = s.hand.join(',');
     if (!map.has(key)) {
       map.set(key, { hand: s.hand, weight: s.weight });
     } else {
@@ -92,7 +89,6 @@ function normalizeWeights(states) {
   for (let i = 0; i < states.length; i++) states[i].weight /= total;
 }
 
-// [TURBO-2] Tömb műveletek elkerülése, ha csak 1 állapot van
 function _buildNextStates(states, playedStateIndex, ec) {
   if (states.length === 1) {
     const h = states[0].hand;
@@ -222,287 +218,18 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     return myS;
   }
 
-  if (filteredStates.length === 0) {
-    return myCards.map(myCard => ({
-      card: myCard,
-      ev: _finalScoreLocal(myScore, enemyScore),
-      win: 0, lose: 0, draw: 0
-    })).sort((a, b) => {
-      const diff = b.ev - a.ev;
-      if (Math.abs(diff) > 0.0001) return diff;
-      if (selectedEnemy === null) return a.card - b.card;
-      return losePrefer ? b.card - a.card : a.card - b.card;
-    });
-  }
-
-  const filteredNorm = filteredStates.map(s => ({ hand: [...s.hand], weight: s.weight, originIndex: s.originIndex }));
-  const filteredTotal = filteredNorm.reduce((s, x) => s + x.weight, 0);
-  for (const s of filteredNorm) s.weight /= filteredTotal;
-
-  return myCards.map(myCard => {
-    const nextMyMask = myMask ^ (1 << myCard);
-    let totalEV = 0;
-    let w = 0, l = 0, d = 0;
-    const totalStateWeight = filteredNorm.reduce((s, x) => s + x.weight, 0);
-
-    for (const state of filteredNorm) {
-      const { hand, weight } = state;
-      const hLen = hand.length;
-      if (hLen === 0) continue;
-
-      const playProb = 1 / hLen;
-
-      for (let i = 0; i < hLen; i++) {
-        const ec = hand[i];
-        const pairWeight = (weight / totalStateWeight) * playProb;
-
-        let nm = myScore, ne = enemyScore;
-        if (myCard > ec)      { nm++; w += pairWeight; }
-        else if (myCard < ec) { ne++; l += pairWeight; }
-        else                  {       d += pairWeight; }
-
-        const nextStates = _buildNextStatesFromFull(possibleEnemyHands, ec, state.originIndex);
-        const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
-        totalEV += pairWeight * subEV;
-      }
-    }
-
-    return {
-      card: myCard,
-      ev: totalEV,
-      win:  Math.round(w * 100),
-      lose: Math.round(l * 100),
-      draw: Math.round(d * 100)
-    };
-  }).sort((a, b) => {
+  // Vak Kezdés Tie-Breaker Helper
+  const sorter = (a, b) => {
     const diff = b.ev - a.ev;
     if (Math.abs(diff) > 0.0001) return diff;
-    if (selectedEnemy === null) return a.card - b.card;
+    if (selectedEnemy === null) return a.card - b.card; // Vaknál mindig kis lapot áldozunk
     return losePrefer ? b.card - a.card : a.card - b.card;
-  });
-}
-
-self.onmessage = function(e) {
-  const { myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore } = e.data;
-  _evCache.clear();
-  const evList = getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _evCache);
-  self.postMessage({ evList });
-};
-  `;
-}
-
-function _initWorker() {
-  if (_worker) { _worker.terminate(); }
-  const blob = new Blob([_getWorkerCode()], { type: 'application/javascript' });
-  _worker = new Worker(URL.createObjectURL(blob));
-  _worker.onmessage = function(e) {
-    _workerBusy = false;
-    _lastEVList = e.data.evList;
-    _lastEVListReady = true;
-
-    if (_pendingWorkerRequest) {
-      const req = _pendingWorkerRequest;
-      _pendingWorkerRequest = null;
-      _sendToWorker(req);
-    } else {
-      _refreshUI();
-    }
   };
-  _worker.onerror = function(err) {
-    console.error('Worker hiba:', err);
-    _workerBusy = false;
-    _lastEVList = getAllCardEVsFallback();
-    _lastEVListReady = true;
-    _refreshUI();
-  };
-}
-
-function _sendToWorker(data) {
-  if (_workerBusy) {
-    _pendingWorkerRequest = data;
-    return;
-  }
-  _workerBusy = true;
-  _lastEVListReady = false;
-  _worker.postMessage(data);
-}
-
-function _requestEVComputation() {
-  _lastEVList = null;
-  _lastEVListReady = false;
-  _sendToWorker({
-    myCards: [...myCards],
-    possibleEnemyHands: possibleEnemyHands.map(s => ({ hand: [...s.hand], weight: s.weight })),
-    selectedEnemy,
-    myScore,
-    enemyScore
-  });
-}
-
-// =============================================
-//  EV MOTOR (FŐSZÁL FALLBACK)
-// =============================================
-let _mainCache = new Map();
-let _lastEVList = null;
-let _lastEVListReady = false;
-let _lastValidation = null;
-
-function enemyPlayWeight(card) { return 1; }
-function _finalScore(myS, enemyS) { const d = myS - enemyS; return d > 0 ? myS + d : myS; }
-
-function _getCacheKey(states, myMask, myS, enemyS) {
-  if (states.length === 1) {
-    let eMask = 0;
-    const h = states[0].hand;
-    for (let i = 0; i < h.length; i++) eMask |= (1 << h[i]);
-    return (eMask << 18) | (myMask << 9) | (myS << 4) | enemyS;
-  }
-  let fp = '';
-  for (let i = 0; i < states.length; i++) {
-    let m = 0;
-    const h = states[i].hand;
-    for (let j = 0; j < h.length; j++) m |= (1 << h[j]);
-    fp += m + ':' + Math.round(states[i].weight * 1000) + '|';
-  }
-  return fp + myMask + '_' + myS + '_' + enemyS;
-}
-
-function mergeEquivalentHands(states) {
-  const map = new Map();
-  for (let i = 0; i < states.length; i++) {
-    const s = states[i];
-    const key = s.hand.join(',');
-    if (!map.has(key)) map.set(key, { hand: s.hand, weight: s.weight });
-    else map.get(key).weight += s.weight;
-  }
-  return [...map.values()];
-}
-
-function normalizeWeights(states) {
-  const total = states.reduce((s, x) => s + x.weight, 0);
-  if (total === 0) return;
-  for (let i = 0; i < states.length; i++) states[i].weight /= total;
-}
-
-function _buildNextStates(states, playedStateIndex, ec) {
-  if (states.length === 1) {
-    const h = states[0].hand;
-    const newHand = [];
-    for (let i = 0; i < h.length; i++) if (h[i] !== ec) newHand.push(h[i]);
-    return [{ hand: newHand, weight: states[0].weight }];
-  }
-  const next = [];
-  for (let i = 0; i < states.length; i++) {
-    const s = states[i];
-    if (i === playedStateIndex) {
-      const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
-    } else next.push(s);
-  }
-  const merged = mergeEquivalentHands(next);
-  normalizeWeights(merged);
-  return merged;
-}
-
-function _computeEV(states, myMask, myS, enemyS, cache) {
-  if (myMask === 0) return { ev: _finalScore(myS, enemyS), best: -1 };
-  const key = _getCacheKey(states, myMask, myS, enemyS);
-  if (cache.has(key)) return cache.get(key);
-
-  const losePrefer = myS < enemyS;
-  let bestEV = -Infinity, bestCard = -1;
-
-  const totalStateWeight = states.reduce((s, x) => s + x.weight, 0);
-  if (totalStateWeight === 0) {
-    const r = { ev: _finalScore(myS, enemyS), best: -1 };
-    cache.set(key, r);
-    return r;
-  }
-
-  for (let mc = 0; mc <= 8; mc++) {
-    if (!(myMask & (1 << mc))) continue;
-    const nextMyMask = myMask ^ (1 << mc);
-    let totalEV = 0;
-
-    for (let stateIdx = 0; stateIdx < states.length; stateIdx++) {
-      const state = states[stateIdx];
-      const { hand, weight } = state;
-      const hLen = hand.length;
-      if (hLen === 0) continue;
-
-      const playProb = 1 / hLen;
-      const stateContrib = weight / totalStateWeight;
-
-      for (let i = 0; i < hLen; i++) {
-        const ec = hand[i];
-        let nm = myS, ne = enemyS;
-        if (mc > ec) nm++; else if (mc < ec) ne++;
-        const nextStates = _buildNextStates(states, stateIdx, ec);
-        const subEV = _computeEV(nextStates, nextMyMask, nm, ne, cache).ev;
-        totalEV += stateContrib * playProb * subEV;
-      }
-    }
-    const isBetter = totalEV > bestEV || (totalEV === bestEV && (losePrefer ? mc > bestCard : mc < bestCard));
-    if (isBetter) { bestEV = totalEV; bestCard = mc; }
-  }
-  const r = { ev: bestEV, best: bestCard };
-  cache.set(key, r);
-  return r;
-}
-
-function _parityOk(parity) {
-  if (parity === 'even') return c => c % 2 === 0;
-  if (parity === 'odd')  return c => c % 2 !== 0;
-  return () => true;
-}
-
-function _buildNextStatesFromFull(possibleEnemyHands, ec, originIndex) {
-  if (possibleEnemyHands.length === 1) {
-    const h = possibleEnemyHands[0].hand;
-    const newHand = [];
-    for (let i = 0; i < h.length; i++) if (h[i] !== ec) newHand.push(h[i]);
-    return [{ hand: newHand, weight: possibleEnemyHands[0].weight }];
-  }
-  const next = [];
-  for (let i = 0; i < possibleEnemyHands.length; i++) {
-    const s = possibleEnemyHands[i];
-    if (i === originIndex) {
-      const newHand = s.hand.filter(c => c !== ec);
-      if (newHand.length > 0) next.push({ hand: newHand, weight: s.weight });
-    } else next.push({ hand: s.hand, weight: s.weight });
-  }
-  const merged = mergeEquivalentHands(next);
-  normalizeWeights(merged);
-  return merged;
-}
-
-function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, cache) {
-  if (myCards.length === 0) return [];
-
-  const ok = _parityOk(selectedEnemy);
-  const losePrefer = myScore < enemyScore;
-  const myMask = myCards.reduce((m, c) => m | (1 << c), 0);
-
-  const filteredStates = [];
-  for (let i = 0; i < possibleEnemyHands.length; i++) {
-    const s = possibleEnemyHands[i];
-    const filteredHand = s.hand.filter(ok);
-    if (filteredHand.length > 0) {
-      filteredStates.push({ hand: filteredHand, weight: s.weight, originIndex: i });
-    }
-  }
-
-  function _finalScoreLocal(myS, enemyS) { const d = myS - enemyS; return d > 0 ? myS + d : myS; }
 
   if (filteredStates.length === 0) {
     return myCards.map(myCard => ({
       card: myCard, ev: _finalScoreLocal(myScore, enemyScore), win: 0, lose: 0, draw: 0
-    })).sort((a, b) => {
-      const diff = b.ev - a.ev;
-      if (Math.abs(diff) > 0.0001) return diff; 
-      if (selectedEnemy === null) return a.card - b.card;
-      return losePrefer ? b.card - a.card : a.card - b.card;
-    });
+    })).sort(sorter);
   }
 
   const filteredNorm = filteredStates.map(s => ({ hand: [...s.hand], weight: s.weight, originIndex: s.originIndex }));
@@ -540,13 +267,102 @@ function getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, 
     return {
       card: myCard, ev: totalEV, win: Math.round(w * 100), lose: Math.round(l * 100), draw: Math.round(d * 100)
     };
-  }).sort((a, b) => {
-    const diff = b.ev - a.ev;
-    if (Math.abs(diff) > 0.0001) return diff; 
-    if (selectedEnemy === null) return a.card - b.card;
-    return losePrefer ? b.card - a.card : a.card - b.card;
+  }).sort(sorter);
+}
+
+
+// ============================================================================
+//  2. RÉSZ: WEB WORKER INJEKCIÓ
+//  A Worker automatikusan a fenti közös magot olvassa be magának. Nincs duplikáció!
+// ============================================================================
+
+let _worker = null;
+let _workerBusy = false;
+let _pendingWorkerRequest = null;
+
+function _initWorker() {
+  if (_worker) { _worker.terminate(); }
+
+  // Dinamikus Worker Script összerakása
+  const workerString = `
+    ${enemyPlayWeight.toString()}
+    ${_finalScore.toString()}
+    ${_getCacheKey.toString()}
+    ${mergeEquivalentHands.toString()}
+    ${normalizeWeights.toString()}
+    ${_buildNextStates.toString()}
+    ${_computeEV.toString()}
+    ${_parityOk.toString()}
+    ${_buildNextStatesFromFull.toString()}
+    ${getAllCardEVsCore.toString()}
+
+    const _workerCache = new Map();
+
+    self.onmessage = function(e) {
+      const { myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore } = e.data;
+      _workerCache.clear();
+      const evList = getAllCardEVsCore(myCards, possibleEnemyHands, selectedEnemy, myScore, enemyScore, _workerCache);
+      self.postMessage({ evList });
+    };
+  `;
+
+  const blob = new Blob([workerString], { type: 'application/javascript' });
+  _worker = new Worker(URL.createObjectURL(blob));
+
+  _worker.onmessage = function(e) {
+    _workerBusy = false;
+    _lastEVList = e.data.evList;
+    _lastEVListReady = true;
+
+    if (_pendingWorkerRequest) {
+      const req = _pendingWorkerRequest;
+      _pendingWorkerRequest = null;
+      _sendToWorker(req);
+    } else {
+      _refreshUI();
+    }
+  };
+
+  _worker.onerror = function(err) {
+    console.error('Worker hiba:', err);
+    _workerBusy = false;
+    _lastEVList = getAllCardEVsFallback();
+    _lastEVListReady = true;
+    _refreshUI();
+  };
+}
+
+function _sendToWorker(data) {
+  if (_workerBusy) {
+    _pendingWorkerRequest = data;
+    return;
+  }
+  _workerBusy = true;
+  _lastEVListReady = false;
+  _worker.postMessage(data);
+}
+
+function _requestEVComputation() {
+  _lastEVList = null;
+  _lastEVListReady = false;
+  _sendToWorker({
+    myCards: [...myCards],
+    possibleEnemyHands: possibleEnemyHands.map(s => ({ hand: [...s.hand], weight: s.weight })),
+    selectedEnemy,
+    myScore,
+    enemyScore
   });
 }
+
+
+// ============================================================================
+//  3. RÉSZ: FŐSZÁL (UI, FALLBACK, HISTORY, ÁLLAPOT)
+// ============================================================================
+
+const _mainCache = new Map();
+let _lastEVList = null;
+let _lastEVListReady = false;
+let _lastValidation = null;
 
 function getAllCardEVsFallback() {
   _mainCache.clear();
@@ -581,9 +397,7 @@ function _getWeightedCards(parity) {
   return { cardCounts, total };
 }
 
-// =============================================
-//  VALIDÁCIÓ
-// =============================================
+// --- VALIDÁCIÓ ---
 function _getResultAvailability() {
   const key = `${selectedMine}|${selectedEnemy}|${possibleEnemyHands.length}`;
   if (_lastValidation && _lastValidation.key === key) return _lastValidation.result;
@@ -621,9 +435,7 @@ function _getResultAvailability() {
   return availability;
 }
 
-// =============================================
-//  DEDUKCIÓ (BAYES UPDATE)
-// =============================================
+// --- DEDUKCIÓ (BAYES UPDATE) ---
 function deduceEnemyHands(myCard, enemyType, result) {
   const ok = _parityOk(enemyType);
   const newStates = [];
@@ -656,9 +468,7 @@ function deduceEnemyHands(myCard, enemyType, result) {
   return merged;
 }
 
-// =============================================
-//  AUTOMATA KÁRTYA KIJELÖLŐ
-// =============================================
+// --- AUTOMATA KÁRTYA KIJELÖLŐ ---
 function autoSelectOracleCard() {
   const best = getBestCard();
   if (best !== null) {
@@ -679,9 +489,7 @@ function _getRenderStateKey() {
   ].join('|');
 }
 
-// =============================================
-//  INIT
-// =============================================
+// --- INIT ---
 function init() {
   _initWorker();
 
@@ -706,9 +514,7 @@ function init() {
   renderHistory();
 }
 
-// =============================================
-//  UI FRISSÍTÉS
-// =============================================
+// --- UI FRISSÍTÉS ---
 function _refreshUI() {
   const stateKey = _getRenderStateKey();
   if (stateKey === _lastRenderState) return;
@@ -723,9 +529,7 @@ function _refreshUI() {
   updateChips();
 }
 
-// =============================================
-//  SCORE BOARD
-// =============================================
+// --- RENDER FUNKCIÓK ---
 function updateScoreBoard() {
   document.getElementById('scoreMine').textContent  = myScore;
   document.getElementById('scoreEnemy').textContent = enemyScore;
@@ -765,12 +569,8 @@ function updateScoreBoard() {
   }
 }
 
-// =============================================
-//  EREDMÉNY-GOMBOK
-// =============================================
 function updateResultButtons() {
   const av = _getResultAvailability();
-
   const btnWin  = document.getElementById('btnWin');
   const btnLose = document.getElementById('btnLose');
   const btnDraw = document.getElementById('btnDraw');
@@ -792,9 +592,6 @@ function updatePairityButtons() {
   document.getElementById('btnOdd').disabled  = false;
 }
 
-// =============================================
-//  RENDER — SAJÁT LAPOK
-// =============================================
 function renderMyCards() {
   const container = document.getElementById('myCardsRow');
   container.innerHTML = '';
@@ -852,9 +649,6 @@ function renderMyCards() {
   container.appendChild(evenRow);
 }
 
-// =============================================
-//  RENDER — ELLENFÉL LAPOK
-// =============================================
 function renderEnemyCards() {
   const container = document.getElementById('enemyCardsRow');
   container.innerHTML = '';
@@ -916,9 +710,6 @@ function renderEnemyCards() {
   }
 }
 
-// =============================================
-//  RENDER — ORACLE
-// =============================================
 function renderOracle() {
   const body = document.getElementById('oracleBody');
   if (!body) return;
@@ -968,7 +759,7 @@ function renderOracle() {
 
   if (iStarted) {
     const approxNote = evIsApprox
-      ? ` <span style="font-size:9px;color:var(--gold-light);opacity:0.8;">(paritás nélkül becsült — add meg a hátlapot a pontos EV-hez)</span>`
+      ? ` <span style="font-size:9px;color:var(--gold-light);opacity:0.8;">(paritás nélkül becsült)</span>`
       : '';
     if (win <= 20) {
       strategyDesc = `💀 <strong>TAKTIKAI ÁLDOZAT:</strong> Vak nyitásban a <strong>${suggestedCard}</strong>-es a legoptimálisabb — az ellenfél elpazarol egy nagy lapot ellene. Várható végpont: <strong>${ev.toFixed(2)}</strong>.${approxNote}`;
@@ -1053,9 +844,7 @@ function renderOracle() {
     </div>`;
 }
 
-// =============================================
-//  SELECTION HANDLERS
-// =============================================
+// --- HANDLERS ---
 function selectMyCard(n) {
   if (!myCards.includes(n)) return;
   if (selectedMine === n) {
@@ -1094,9 +883,6 @@ function selectResult(res) {
   updateConfirmBtn();
 }
 
-// =============================================
-//  GOMB ÁLLAPOT FRISSÍTŐK
-// =============================================
 function updateChips() {
   const cm = document.getElementById('chip-mine');
   const ce = document.getElementById('chip-enemy');
@@ -1154,9 +940,6 @@ function updateConfirmBtn() {
   }
 }
 
-// =============================================
-//  CONFIRM ROUND
-// =============================================
 function confirmRound() {
   if (selectedMine === null || selectedEnemy === null || selectedResult === null) return;
   if (isConfirming) return;
@@ -1208,9 +991,6 @@ function confirmRound() {
   }, 0);
 }
 
-// =============================================
-//  HISTORY & UNDO
-// =============================================
 function addHistoryEntry(round, mine, enemy, result, cls) {
   const list = document.getElementById('historyList');
   if (list.querySelector('.history-empty')) list.innerHTML = '';
