@@ -801,7 +801,11 @@ function undoLast() {
 
   iStarted = snap.iStarted;
   const chkUndo = document.getElementById('chkIStart');
-  if (chkUndo) chkUndo.checked = iStarted;
+  if (chkUndo) {
+    chkUndo.checked = iStarted;
+    // Ha visszavontuk az első kört, a checkbox újra engedélyeződik
+    if (snap.roundNum === 0) chkUndo.disabled = false;
+  }
 
   selectedMine = null; selectedEnemy = null; selectedResult = null;
   _cardManuallySelected = false;
