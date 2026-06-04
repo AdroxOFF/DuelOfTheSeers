@@ -175,6 +175,7 @@ let iStarted       = false;
 
 let history  = [];
 let roundNum = 0;
+let matchRecorded = false; // megakadályozza a dupla mentést
 
 function init() {
   const chk = document.getElementById('chkIStart');
@@ -329,6 +330,7 @@ function updateScoreBoard() {
     } else {
        finalProj.innerHTML = T('finalDraw');
     }
+    recordMatchIfFinished();
   } else {
     if (myScore > enemyScore) {
        let projected = myScore + diff;
@@ -888,7 +890,7 @@ function undoLast() {
 
 function resetAll() {
   myCards = [...ALL_CARDS]; possibleEnemyHands = [ [...ALL_CARDS] ]; history = []; roundNum = 0;
-  myScore = 0; enemyScore = 0;
+  myScore = 0; enemyScore = 0; matchRecorded = false;
   selectedMine = null; selectedEnemy = null; selectedResult = null;
 
   const chk = document.getElementById('chkIStart'); if (chk) chk.checked = false; iStarted = false;
@@ -907,5 +909,131 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { e.preventDefault(); resetAll(); }
   else if (e.key === 'Backspace' && document.activeElement.tagName !== 'INPUT') { e.preventDefault(); undoLast(); }
 });
+
+// =============================================
+//  MATCH HISTORY — localStorage
+// =============================================
+const MATCH_STORAGE_KEY = 'latok_parbaja_matches';
+
+function loadMatches() {
+  try {
+    return JSON.parse(localStorage.getItem(MATCH_STORAGE_KEY) || '[]');
+  } catch { return []; }
+}
+
+function saveMatch(record) {
+  const matches = loadMatches();
+  matches.unshift(record); // legújabb elöl
+  try {
+    localStorage.setItem(MATCH_STORAGE_KEY, JSON.stringify(matches));
+  } catch {}
+}
+
+function clearAllMatches() {
+  if (!confirm(currentLang === 'en'
+    ? 'Delete all match history? This cannot be undone.'
+    : 'Törlöd az összes meccset? Ez nem vonható vissza.')) return;
+  localStorage.removeItem(MATCH_STORAGE_KEY);
+  renderMatchHistory();
+}
+
+// Játék végén hívódik — elmenti az aktuális meccset (csak egyszer)
+function recordMatchIfFinished() {
+  if (myCards.length !== 0) return;
+  if (matchRecorded) return; // már elmentettük ezt a meccset
+  matchRecorded = true;
+
+  const diff = myScore - enemyScore;
+  const outcome = myScore > enemyScore ? 'win' : myScore < enemyScore ? 'lose' : 'draw';
+  const finalPts = outcome === 'win' ? myScore + diff : myScore;
+
+  saveMatch({
+    date:      new Date().toISOString(),
+    iStarted,
+    myScore,
+    enemyScore,
+    outcome,
+    finalPts,
+  });
+}
+
+// Match History panel megnyitása/bezárása
+function toggleMatchHistory() {
+  const panel = document.getElementById('matchHistoryPanel');
+  const isOpen = panel.style.display !== 'none';
+  panel.style.display = isOpen ? 'none' : 'block';
+  if (!isOpen) renderMatchHistory();
+}
+
+function renderMatchHistory() {
+  const matches = loadMatches();
+  const container = document.getElementById('matchHistoryList');
+  const statsEl   = document.getElementById('matchHistoryStats');
+
+  if (matches.length === 0) {
+    container.innerHTML = `<div class="history-empty" style="padding:16px 0;">${currentLang === 'en' ? 'No matches recorded yet.' : 'Még nincs rögzített meccs.'}</div>`;
+    statsEl.innerHTML = '';
+    return;
+  }
+
+  // Statisztikák
+  const total    = matches.length;
+  const wins     = matches.filter(m => m.outcome === 'win').length;
+  const losses   = matches.filter(m => m.outcome === 'lose').length;
+  const draws    = matches.filter(m => m.outcome === 'draw').length;
+  const winRate  = Math.round((wins / total) * 100);
+  const avgFinal = (matches.reduce((s, m) => s + m.finalPts, 0) / total).toFixed(1);
+  const avgWin   = wins > 0
+    ? (matches.filter(m => m.outcome === 'win').reduce((s, m) => s + m.finalPts, 0) / wins).toFixed(1)
+    : '—';
+
+  const iStartedMatches = matches.filter(m => m.iStarted);
+  const enemyStartedMatches = matches.filter(m => !m.iStarted);
+  const avgIStart    = iStartedMatches.length > 0
+    ? (iStartedMatches.reduce((s, m) => s + m.finalPts, 0) / iStartedMatches.length).toFixed(1) : '—';
+  const avgEnemyStart = enemyStartedMatches.length > 0
+    ? (enemyStartedMatches.reduce((s, m) => s + m.finalPts, 0) / enemyStartedMatches.length).toFixed(1) : '—';
+
+  const L = currentLang === 'en';
+  statsEl.innerHTML = `
+    <div class="mh-stats-grid">
+      <div class="mh-stat"><div class="mh-stat-val">${total}</div><div class="mh-stat-label">${L ? 'Matches' : 'Meccs'}</div></div>
+      <div class="mh-stat"><div class="mh-stat-val" style="color:var(--emerald-light)">${winRate}%</div><div class="mh-stat-label">${L ? 'Win rate' : 'Nyerési arány'}</div></div>
+      <div class="mh-stat"><div class="mh-stat-val" style="color:var(--gold-light)">${avgFinal}</div><div class="mh-stat-label">${L ? 'Avg pts' : 'Átlag pont'}</div></div>
+      <div class="mh-stat"><div class="mh-stat-val" style="color:var(--emerald-light)">${avgWin}</div><div class="mh-stat-label">${L ? 'Avg pts (wins)' : 'Átlag pont (győzelem)'}</div></div>
+      <div class="mh-stat"><div class="mh-stat-val" style="color:var(--purple-light)">${avgIStart}</div><div class="mh-stat-label">${L ? 'Avg pts (I start)' : 'Átlag (én kezdtem)'}</div></div>
+      <div class="mh-stat"><div class="mh-stat-val" style="color:var(--gold)">${avgEnemyStart}</div><div class="mh-stat-label">${L ? 'Avg pts (enemy starts)' : 'Átlag (ell. kezdett)'}</div></div>
+    </div>
+    <div class="mh-wld">
+      <span style="color:var(--emerald-light)">▲ ${wins} ${L ? 'W' : 'Gy'}</span>
+      <span style="color:var(--crimson-light)">▼ ${losses} ${L ? 'L' : 'V'}</span>
+      <span style="color:#a890d0">◈ ${draws} ${L ? 'D' : 'D'}</span>
+    </div>
+  `;
+
+  // Meccsek listája
+  container.innerHTML = matches.map((m, i) => {
+    const d = new Date(m.date);
+    const dateStr = `${d.getFullYear()}.${String(d.getMonth()+1).padStart(2,'0')}.${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+    const outcomeLabel = m.outcome === 'win'
+      ? `<span class="h-win">${L ? 'WIN' : 'GYŐZELEM'}</span>`
+      : m.outcome === 'lose'
+      ? `<span class="h-lose">${L ? 'LOSE' : 'VERESÉG'}</span>`
+      : `<span class="h-draw">${L ? 'DRAW' : 'DÖNTETLEN'}</span>`;
+    const whoStarted = m.iStarted
+      ? `<span style="color:var(--purple-light)">${L ? 'I started' : 'Én kezdtem'}</span>`
+      : `<span style="color:var(--gold)">${L ? 'Enemy started' : 'Ell. kezdett'}</span>`;
+    const ptsColor = m.outcome === 'win' ? 'var(--emerald-light)' : m.outcome === 'lose' ? 'var(--crimson-light)' : '#a890d0';
+    return `
+      <div class="mh-entry">
+        <span class="mh-num">#${total - i}</span>
+        <span class="mh-date">${dateStr}</span>
+        ${whoStarted}
+        <span>${m.myScore} – ${m.enemyScore}</span>
+        ${outcomeLabel}
+        <span style="color:${ptsColor};font-weight:700;">${m.finalPts} ${L ? 'pts' : 'pont'}</span>
+      </div>`;
+  }).join('');
+}
 
 init();
