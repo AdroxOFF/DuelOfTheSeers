@@ -330,7 +330,6 @@ function updateScoreBoard() {
     } else {
        finalProj.innerHTML = T('finalDraw');
     }
-    recordMatchIfFinished();
   } else {
     if (myScore > enemyScore) {
        let projected = myScore + diff;
@@ -818,6 +817,19 @@ function confirmRound() {
   possibleEnemyHands = nextEnemyHands;
   myCards = myCards.filter(c => c !== selectedMine);
 
+  // Ha elfogytak a lapok → meccs vége, mentés
+  if (myCards.length === 0 && !matchRecorded) {
+    matchRecorded = true;
+    const diff    = myScore - enemyScore;
+    const outcome = myScore > enemyScore ? 'win' : myScore < enemyScore ? 'lose' : 'draw';
+    const finalPts = outcome === 'win' ? myScore + diff : myScore;
+    saveMatch({ date: new Date().toISOString(), iStarted, myScore, enemyScore, outcome, finalPts });
+    // Ha a panel nyitva van, azonnal frissítjük
+    if (document.getElementById('matchHistoryPanel').style.display !== 'none') {
+      renderMatchHistory();
+    }
+  }
+
   const labels = { win: T('resWin'), lose: T('resLose'), draw: T('resDraw') };
   const enemyLabel = (selectedEnemy === 'even' ? T('chipEven') : T('chipOdd')) + (iStarted ? ` (${T('iStart')})` : '');
   const resultClass = { win: 'h-win', lose: 'h-lose', draw: 'h-draw' }[selectedResult];
@@ -935,26 +947,6 @@ function clearAllMatches() {
     : 'Törlöd az összes meccset? Ez nem vonható vissza.')) return;
   localStorage.removeItem(MATCH_STORAGE_KEY);
   renderMatchHistory();
-}
-
-// Játék végén hívódik — elmenti az aktuális meccset (csak egyszer)
-function recordMatchIfFinished() {
-  if (myCards.length !== 0) return;
-  if (matchRecorded) return; // már elmentettük ezt a meccset
-  matchRecorded = true;
-
-  const diff = myScore - enemyScore;
-  const outcome = myScore > enemyScore ? 'win' : myScore < enemyScore ? 'lose' : 'draw';
-  const finalPts = outcome === 'win' ? myScore + diff : myScore;
-
-  saveMatch({
-    date:      new Date().toISOString(),
-    iStarted,
-    myScore,
-    enemyScore,
-    outcome,
-    finalPts,
-  });
 }
 
 // Match History panel megnyitása/bezárása
