@@ -19,6 +19,7 @@
   <div class="lang-switcher">
     <button id="langHU" class="lang-btn lang-active" onclick="setLang('hu')">HU</button>
     <button id="langEN" class="lang-btn" onclick="setLang('en')">EN</button>
+    <button class="lang-btn" onclick="toggleMatchHistory()" style="margin-left:6px;">📊</button>
   </div>
 
   <header>
@@ -128,6 +129,18 @@
     </div>
 
   </div>
+  <!-- MATCH HISTORY PANEL -->
+  <div id="matchHistoryPanel" style="display:none; margin-top:28px;">
+    <div class="panel" style="padding:24px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:18px;">
+        <div class="panel-title" style="margin-bottom:0;">📊 Match History</div>
+        <button class="lang-btn" onclick="clearAllMatches()" style="color:var(--crimson-light); border-color:var(--crimson);">🗑 Törlés</button>
+      </div>
+      <div id="matchHistoryStats" style="margin-bottom:16px;"></div>
+      <div id="matchHistoryList"></div>
+    </div>
+  </div>
+
 </div>
 
 <script>
