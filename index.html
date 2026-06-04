@@ -14,9 +14,15 @@
 
 <div id="app">
 
+  <!-- NYELV VÁLTÓ -->
+  <div class="lang-switcher">
+    <button id="langHU" class="lang-btn lang-active" onclick="setLang('hu')">HU</button>
+    <button id="langEN" class="lang-btn" onclick="setLang('en')">EN</button>
+  </div>
+
   <header>
     <div class="title-rune">⚔ Látók Párbaja ⚔</div>
-    <div class="title-sub">Pontmaximalizáló AI Rendszer v8.0</div>
+    <div class="title-sub">Pontmaximalizáló AI Rendszer v4.4</div>
     <div class="shortcut-hint" style="margin-top:8px;">
       <kbd>ESC</kbd> Teljes reset &nbsp;|&nbsp; <kbd>⌫</kbd> Visszavonás
     </div>
@@ -125,7 +131,13 @@
 
 <script>
   document.getElementById('chkIStart').addEventListener('change', function() {
-    document.getElementById('toggleText').textContent = this.checked ? 'Én kezdem' : 'Ellenfél kezd';
+    const t = document.getElementById('toggleText');
+    // A T() függvény az app.js-ben van, ezért az app.js betöltése után fut
+    if (window.T) {
+      t.textContent = this.checked ? T('iStart') : T('enemyStarts');
+    } else {
+      t.textContent = this.checked ? 'Én kezdem' : 'Ellenfél kezd';
+    }
   });
 </script>
 <script src="app.js"></script>
